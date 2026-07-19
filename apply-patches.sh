@@ -35,6 +35,6 @@ SCRIPT_DIR=$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)
 
 echo "== apply-patches: dozenos-rebrand-arm64 =="
 "$SCRIPT_DIR/patches/kernel-config-bf2-offload.sh" "$TARGET"
-"$SCRIPT_DIR/patches/kernel-perf-nonfatal.sh" "$TARGET"
+"$SCRIPT_DIR/patches/install-kernel-patches.sh" "$TARGET"
 "$SCRIPT_DIR/patches/ofed-25-01.sh" "$TARGET"
 echo "apply-patches: done"

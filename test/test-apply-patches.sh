@@ -70,19 +70,18 @@ CONFIG_MMC_SDHCI_PLTFM=m
 # CONFIG_MMC_SDHCI_OF_DWCMSHC is not set
 EOF
 
+  mkdir -p "$lk/patches/kernel"
+  cat > "$lk/patches/kernel/0002-build-linux-perf-package.patch" <<'EOF'
+(placeholder upstream patch)
+EOF
   cat > "$lk/build-kernel.sh" <<'EOF'
 #!/bin/bash
 CWD=$(pwd)
-KERNEL_SRC=linux
-set -e
-KERNEL_VERSION=6.18.38
-KERNEL_SUFFIX=-dozenos
-echo "I: Build Debian Kernel package"
-touch .scmversion
-make bindeb-pkg BUILD_TOOLS=1 LOCALVERSION=${KERNEL_SUFFIX} KDEB_PKGVERSION=${KERNEL_VERSION}-1 -j $(getconf _NPROCESSORS_ONLN)
-
-cd $CWD
-EPHEMERAL_KERNEL_KEY=$(grep -E "^CONFIG_MODULE_SIG_KEY=" "${KERNEL_SRC}/.config")
+PATCH_DIR=${CWD}/patches/kernel
+for patch in $(ls ${PATCH_DIR}); do
+    patch -p1 < ${PATCH_DIR}/${patch}
+done
+make bindeb-pkg BUILD_TOOLS=1
 EOF
 
   cat > "$lk/build-mellanox-ofed.sh" <<'EOF'
@@ -164,12 +163,12 @@ expect_line "$OFED" 'rm -f SOURCES/openmpi_*.tar.gz' "§6.4 upstream trim surviv
 expect_line "$OFED" "  --kernel-extra-args '--with-sf-cfg-drv'" "§6.4 --kernel-extra-args added"
 if bash -n "$OFED"; then ok "§6.4 patched script parses"; else bad "§6.4 patched script parses"; fi
 
-# perf-nonfatal (build-kernel.sh)
-BK="$LK/build-kernel.sh"
-if grep -qF '__kbuild_rc' "$BK"; then ok "perf-nonfatal: guard block applied"; else bad "perf-nonfatal: guard block applied"; fi
-expect_line "$BK" 'set +e' "perf-nonfatal: set +e wraps the make"
-if grep -qF 'linux-image-${KERNEL_VERSION}${KERNEL_SUFFIX}_*.deb' "$BK"; then ok "perf-nonfatal: requires the linux-image deb"; else bad "perf-nonfatal: requires the linux-image deb"; fi
-if bash -n "$BK"; then ok "perf-nonfatal: patched build-kernel.sh parses"; else bad "perf-nonfatal: patched build-kernel.sh parses"; fi
+# install-kernel-patches (the arm64 perf-syscalltbl kernel source patch)
+KP="$LK/patches/kernel/0005-arm64-perf-abs-syscalltbl.patch"
+if [ -f "$KP" ]; then ok "kernel-patch: 0005 installed into patches/kernel/"; else bad "kernel-patch: 0005 installed into patches/kernel/"; fi
+if grep -qF 'syscalltbl = $(srctree)/arch/arm64/tools/syscall_%.tbl' "$KP" 2>/dev/null; then ok "kernel-patch: carries the absolute-syscalltbl fix"; else bad "kernel-patch: carries the absolute-syscalltbl fix"; fi
+# the patch content is byte-identical to the repo source
+if cmp -s "$TOOLKIT/patches/kernel/0005-arm64-perf-abs-syscalltbl.patch" "$KP"; then ok "kernel-patch: installed copy matches repo source"; else bad "kernel-patch: installed copy matches repo source"; fi
 
 # ---------------------------------------------------------------------------
 # Run 2: idempotency -- second run byte-identical.
@@ -248,13 +247,24 @@ else
 fi
 
 make_fixture "$WORK/tree-drift7"
-# upstream changed the bindeb-pkg make line -> perf-nonfatal must die
-sed -i 's/^make bindeb-pkg .*/make bindeb-pkg SOMETHING_ELSE/' \
+# upstream dropped the patches/kernel apply loop -> our kernel patch would be
+# dead, so install-kernel-patches must die
+sed -i '/PATCH_DIR/d; /patches\/kernel/d' \
   "$WORK/tree-drift7/scripts/package-build/linux-kernel/build-kernel.sh"
 if "$SCRIPT" "$WORK/tree-drift7" >/dev/null 2>&1; then
-  bad "perf-nonfatal anchor drift: expected non-zero exit"
+  bad "kernel-patch apply loop gone: expected non-zero exit"
 else
-  ok "perf-nonfatal anchor drift: dies loudly"
+  ok "kernel-patch apply loop gone: dies loudly"
+fi
+
+make_fixture "$WORK/tree-drift8"
+# a pre-existing patch already using the 0005- prefix -> must die (collision)
+cp "$WORK/tree-drift8/scripts/package-build/linux-kernel/patches/kernel/0002-build-linux-perf-package.patch" \
+   "$WORK/tree-drift8/scripts/package-build/linux-kernel/patches/kernel/0005-something-upstream.patch"
+if "$SCRIPT" "$WORK/tree-drift8" >/dev/null 2>&1; then
+  bad "0005 prefix collision: expected non-zero exit"
+else
+  ok "0005 prefix collision: dies loudly"
 fi
 
 # ---------------------------------------------------------------------------
