@@ -18,7 +18,7 @@ set -euo pipefail
 
 die() { printf 'make-bfb: %s\n' "$*" >&2; exit 2; }
 
-MKBFB="" BASE_BFB="" KERNEL="" INITRAMFS="" OUT="" CAPSULE="" BOOT_ARGS=""
+MKBFB="" BASE_BFB="" KERNEL="" INITRAMFS="" OUT="" CAPSULE=""
 while [ $# -gt 0 ]; do
   case "$1" in
     --mkbfb)     MKBFB="${2:-}"; shift 2 ;;
@@ -27,7 +27,6 @@ while [ $# -gt 0 ]; do
     --initramfs) INITRAMFS="${2:-}"; shift 2 ;;
     --out)       OUT="${2:-}"; shift 2 ;;
     --capsule)   CAPSULE="${2:-}"; shift 2 ;;
-    --boot-args) BOOT_ARGS="${2:-}"; shift 2 ;;
     -h|--help)   sed -n '2,17p' "${BASH_SOURCE[0]}" | sed 's/^# \{0,1\}//'; exit 0 ;;
     *)           die "unknown argument: $1" ;;
   esac
@@ -41,15 +40,24 @@ done
 [ -f "$KERNEL" ] || die "kernel image not found: $KERNEL"
 [ -f "$INITRAMFS" ] || die "installer initramfs not found: $INITRAMFS"
 [ -z "$CAPSULE" ] || [ -f "$CAPSULE" ] || die "capsule not found: $CAPSULE"
-[ -z "$BOOT_ARGS" ] || [ -f "$BOOT_ARGS" ] || die "boot-args file not found: $BOOT_ARGS"
+
+# The boot-path is load-bearing: it is the UEFI boot entry ("Linux from
+# rshim") that points at the BFB-embedded kernel Image. WITHOUT it, BF2 UEFI
+# has no entry for our kernel and falls through to whatever is on the eMMC
+# (observed on real hardware: our first BFB, lacking these, only updated
+# ATF/UEFI and then booted the stock eMMC OS). The GUID + boot-args below are
+# the standard BF2 rshim-boot values from bfb-build's create_bfb.
+BA0=$(mktemp) BA2=$(mktemp) BP=$(mktemp) BD=$(mktemp)
+trap 'rm -f "$BA0" "$BA2" "$BP" "$BD"' EXIT
+# ttyAMA1 = the rshim console; initrd=initramfs names the packed initramfs.
+printf 'console=ttyAMA1 console=hvc0 console=ttyAMA0 earlycon=pl011,0x01000000 earlycon=pl011,0x01800000 initrd=initramfs' > "$BA0"
+printf 'console=hvc0 console=ttyAMA0 earlycon=pl011,0x13010000 initrd=initramfs' > "$BA2"
+printf 'VenHw(F019E406-8C9C-11E5-8797-001ACA00BFC4)/Image' > "$BP"
+printf 'Linux from rshim' > "$BD"
 
 args=(--image "$KERNEL" --initramfs "$INITRAMFS")
 [ -n "$CAPSULE" ] && args+=(--capsule "$CAPSULE")
-if [ -n "$BOOT_ARGS" ]; then
-  # v0 and v2 mirror create_bfb: old and new boot-stream versions carry
-  # their own boot-args blob.
-  args+=(--boot-args-v0 "$BOOT_ARGS" --boot-args-v2 "$BOOT_ARGS")
-fi
+args+=(--boot-args-v0 "$BA0" --boot-args-v2 "$BA2" --boot-path "$BP" --boot-desc "$BD")
 
 "$MKBFB" "${args[@]}" "$BASE_BFB" "$OUT"
 
