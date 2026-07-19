@@ -120,10 +120,29 @@ add_opt "$DEFCONFIG" MLX5_TC_SAMPLE y
 # plan.
 add_opt "$DEFCONFIG" MELLANOX_PLATFORM y
 enable_opt "$DEFCONFIG" MLXBF_GIGE m
+
+# BF2 eMMC = Synopsys DesignWare MMC (`dw_mmc-bluefield`, ACPI node PRP0001),
+# NOT the SDHCI dwcmshc controller. Confirmed on real BF2 hardware: the eMMC
+# comes up as `dwmmc_bluefield PRP0001:00 ... mmcblk0 38.9 GiB`; sdhci-of-dwcmshc
+# loads but binds nothing. The eMMC holds the root filesystem, so build the
+# whole stack in (=y) -- it must be available before any initramfs. This is the
+# fix that lets an installed DozenOS boot from the DPU eMMC at all.
+add_opt "$DEFCONFIG" MMC y
+add_opt "$DEFCONFIG" MMC_BLOCK y
+add_opt "$DEFCONFIG" MMC_DW y
+add_opt "$DEFCONFIG" MMC_DW_PLTFM y
+add_opt "$DEFCONFIG" MMC_DW_BLUEFIELD y
+# keep the SDHCI dwcmshc entry too (harmless; other BF variants may use it)
 enable_opt "$DEFCONFIG" MMC_SDHCI_OF_DWCMSHC m
 add_opt "$DEFCONFIG" MLXBF_TMFIFO m
 add_opt "$DEFCONFIG" MLXBF_BOOTCTL m
 add_opt "$DEFCONFIG" MLXBF_PMC m
+# mlxbf-ptm (power/thermal monitor) + IPMB device iface (DPU<->BMC): both ship
+# as NVIDIA SoC driver src (doca SOURCES/SoC) and are upstream in 6.18. Not
+# boot-critical, but complete the BF2 driver set; PTM is relevant to the
+# thermal behaviour seen during bring-up.
+add_opt "$DEFCONFIG" MLXBF_PTM m
+add_opt "$DEFCONFIG" IPMB_DEVICE_INTERFACE m
 add_opt "$DEFCONFIG" GPIO_MLXBF2 m
 add_opt "$DEFCONFIG" GPIO_MLXBF3 m
 add_opt "$DEFCONFIG" PINCTRL_MLXBF3 m
