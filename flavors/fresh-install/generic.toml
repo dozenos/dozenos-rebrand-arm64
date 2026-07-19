@@ -1,0 +1,13 @@
+# Generic arm64 ISO image (first BF2/DPU bring-up target).
+#
+# Same contract as dozenos-rebrand/flavors/: the arm64 nightly workflow
+# points build-dozenos-image at THIS directory via DOZENOS_BUILD_FLAVORS_DIR;
+# the toml basename is the flavor name burned into the image.
+#
+# mstflint: firmware/debug tooling on the DPU itself (mstconfig/mstflint/
+# mstregdump) -- plan §6.5 first choice, stock Debian package, no kernel
+# module needed.
+
+image_format = "iso"
+
+packages = ["mstflint"]
