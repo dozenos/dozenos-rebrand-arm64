@@ -63,26 +63,30 @@ mkdir -p "$root"/{bin,sbin,proc,sys,dev,mnt,lib/modules}
 cp "$BUSYBOX" "$root/bin/busybox"
 chmod +x "$root/bin/busybox"
 
-# The eMMC host driver stack is modular in our kernel -- copy the SDHCI /
-# DWCMSHC / mmc-block modules (and their explicit deps) into the initramfs.
-# HW-CHECK: if /dev/mmcblk0 never appears, widen this list or check depmod.
-mods=(
-  drivers/mmc/host/sdhci.ko drivers/mmc/host/sdhci-pltfm.ko
-  drivers/mmc/host/sdhci-of-dwcmshc.ko
-  drivers/mmc/core/mmc_block.ko drivers/mmc/core/mmc_core.ko
-)
-mkdir -p "$root/lib/modules/$KVER"
-for m in "${mods[@]}"; do
-  # modules may be .ko or .ko.xz (our build compresses); copy whatever exists
-  for cand in "$MODDIR/$m" "$MODDIR/$m.xz" "$MODDIR/$m.zst" "$MODDIR/$m.gz"; do
-    if [ -f "$cand" ]; then
-      mkdir -p "$root/lib/modules/$KVER/$(dirname "$m")"
-      cp "$cand" "$root/lib/modules/$KVER/$(dirname "$m")/"
-    fi
-  done
+# The eMMC host driver stack is modular in our kernel. Copy the SDHCI /
+# DWCMSHC / mmc-block modules (found by basename anywhere under the tree --
+# they live under kernel/drivers/mmc/...) into a flat initramfs dir. Our
+# build compresses modules to .ko.xz and busybox insmod cannot read xz, so
+# DECOMPRESS to plain .ko here; the module signature is inside the .ko and
+# our kernel (CONFIG_MODULE_SIG_KEY) trusts it, so the signed .ko still
+# loads under MODULE_SIG_FORCE. HW-CHECK: if /dev/mmcblk0 never appears,
+# widen this basename list.
+mod_names=(mmc_core mmc_block sdhci sdhci-pltfm sdhci-of-dwcmshc
+           sdhci_pltfm sdhci_of_dwcmshc cqhci)
+mkdir -p "$root/lib/modules"
+for name in "${mod_names[@]}"; do
+  while IFS= read -r ko; do
+    [ -n "$ko" ] || continue
+    base=$(basename "$ko")
+    case "$base" in
+      *.ko.xz)  unxz  -c "$ko" > "$root/lib/modules/${base%.xz}" ;;
+      *.ko.zst) zstd -dq -c "$ko" > "$root/lib/modules/${base%.zst}" ;;
+      *.ko.gz)  gzip -dc "$ko" > "$root/lib/modules/${base%.gz}" ;;
+      *.ko)     cp "$ko" "$root/lib/modules/$base" ;;
+    esac
+  done < <(find "$MODDIR" -type f \( -name "${name}.ko" -o -name "${name}.ko.*" \) 2>/dev/null)
 done
-# modules.dep so modprobe resolves deps (best-effort; init also insmods directly)
-[ -f "$MODDIR/modules.dep" ] && cp "$MODDIR/modules.dep" "$root/lib/modules/$KVER/" || true
+echo "I: bundled modules for $KVER: $(ls "$root/lib/modules" 2>/dev/null | tr '\n' ' ')"
 
 # Normalize the disk to a raw stream, then zstd-compress it into the initramfs.
 if file --brief --mime-type "$DISK" | grep -q 'qemu\|octet' && qemu-img info "$DISK" 2>/dev/null | grep -qi 'file format: qcow2'; then
@@ -107,9 +111,16 @@ mount -t devtmpfs dev /dev 2>/dev/null || mdev -s
 echo
 echo "=== DozenOS BlueField-2 installer ==="
 
-# Load the eMMC host stack (modular in our kernel).
-for ko in $(find /lib/modules -name '*.ko*' 2>/dev/null); do
-  insmod "$ko" 2>/dev/null || true
+# Load the eMMC host stack. Multi-pass insmod so dependency order resolves
+# itself regardless of filename order (mmc_core before sdhci before
+# sdhci-of-dwcmshc, etc.). Stop when a full pass loads nothing new.
+for pass in 1 2 3 4 5; do
+  progress=0
+  for ko in /lib/modules/*.ko; do
+    [ -f "$ko" ] || continue
+    if insmod "$ko" 2>/dev/null; then progress=1; mv "$ko" "$ko.done" 2>/dev/null || rm -f "$ko"; fi
+  done
+  [ "$progress" = 0 ] && break
 done
 
 # HW-CHECK: eMMC device. BF2 eMMC is normally /dev/mmcblk0. Wait for it.
