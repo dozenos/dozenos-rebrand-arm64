@@ -1,0 +1,37 @@
+# BlueField-2 DPU disk image.
+#
+# Produces a fully-installed disk image (EFI + root, squashfs + GRUB already
+# laid down by raw_image.py) -- NOT a live ISO. First boot comes up already
+# installed, no interactive `install image` step. The BFB wrap job (bfb/)
+# converts this to raw and flashes it onto the DPU eMMC with dd; you can
+# also do it by hand:
+#     qemu-img convert -f qcow2 -O raw dozenos-*-dpu-arm64.qcow2 disk.raw
+#     dd if=disk.raw of=/dev/mmcblk0 bs=4M   # on the DPU, from the installer
+#
+# qcow2 (compressed) rather than a bare raw: a raw sized to the eMMC would be
+# a multi-GB release asset (GitHub does not sparse-compress assets), whereas
+# a compressed qcow2 of a mostly-empty disk is ~1 GB. Same disk contents.
+#
+# disk_size = 16: MUST be <= your BF2 board's eMMC size (BF2 eMMC is commonly
+# 16/32/64 GB). dd of a 16 GB image onto a smaller eMMC fails; onto a larger
+# one it leaves the tail unused (fine for bring-up). Tune to your board.
+#
+# console: BF2's rshim/UART console is ttyAMA1 @ 115200 (NVIDIA BSP) -- what
+# `screen /dev/rshim0/console 115200` shows from the host. NEEDS on-hardware
+# confirmation (plan §9.4); if no login prompt appears on the rshim console,
+# this is the first knob to check.
+#
+# rshim is deliberately NOT installed: it is a HOST-side driver (pushes boot
+# streams / serves the tmfifo console+net from the host). The DPU side is
+# reachable via the in-tree MLXBF_TMFIFO (tmfifo_net0 + console) and
+# MLXBF_GIGE (OOB port) drivers enabled in the arm64 kernel config.
+
+image_format = ["qcow2"]
+image_opts = "-c"
+
+disk_size = 16
+
+[boot_settings]
+console_type = "ttyAMA"
+console_num = "1"
+console_speed = "115200"
