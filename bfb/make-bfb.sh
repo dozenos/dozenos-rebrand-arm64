@@ -49,9 +49,14 @@ done
 # the standard BF2 rshim-boot values from bfb-build's create_bfb.
 BA0=$(mktemp) BA2=$(mktemp) BP=$(mktemp) BD=$(mktemp)
 trap 'rm -f "$BA0" "$BA2" "$BP" "$BD"' EXIT
-# ttyAMA1 = the rshim console; initrd=initramfs names the packed initramfs.
-printf 'console=ttyAMA1 console=hvc0 console=ttyAMA0 earlycon=pl011,0x01000000 earlycon=pl011,0x01800000 initrd=initramfs' > "$BA0"
-printf 'console=hvc0 console=ttyAMA0 earlycon=pl011,0x13010000 initrd=initramfs' > "$BA2"
+# console=ttyS0 LAST = the interactive /dev/console: on this BF2 board ttyS0
+# is the rshim console (confirmed by the hw owner), so the installer's output
+# and its drop-to-shell-on-failure land on `screen /dev/rshim0/console`.
+# hvc0/ttyAMA1/ttyAMA0 are kept as fallbacks (a console= for a device that
+# does not register is silently skipped, so listing ttyS0 last is safe even
+# where it is absent). initrd=initramfs names the packed initramfs.
+printf 'console=hvc0 console=ttyAMA1 console=ttyAMA0 console=ttyS0 earlycon=pl011,0x01000000 earlycon=pl011,0x01800000 initrd=initramfs' > "$BA0"
+printf 'console=hvc0 console=ttyAMA0 console=ttyS0 earlycon=pl011,0x13010000 initrd=initramfs' > "$BA2"
 printf 'VenHw(F019E406-8C9C-11E5-8797-001ACA00BFC4)/Image' > "$BP"
 printf 'Linux from rshim' > "$BD"
 

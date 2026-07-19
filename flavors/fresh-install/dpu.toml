@@ -16,10 +16,9 @@
 # 16/32/64 GB). dd of a 16 GB image onto a smaller eMMC fails; onto a larger
 # one it leaves the tail unused (fine for bring-up). Tune to your board.
 #
-# console: BF2's rshim/UART console is ttyAMA1 @ 115200 (NVIDIA BSP) -- what
-# `screen /dev/rshim0/console 115200` shows from the host. NEEDS on-hardware
-# confirmation (plan §9.4); if no login prompt appears on the rshim console,
-# this is the first knob to check.
+# console: on this BF2 board the rshim console (`screen /dev/rshim0/console`)
+# is ttyS0 @ 115200 (confirmed by the hw owner). The installed DozenOS puts
+# its getty/login there so it is reachable over rshim after eMMC boot.
 #
 # rshim is deliberately NOT installed: it is a HOST-side driver (pushes boot
 # streams / serves the tmfifo console+net from the host). The DPU side is
@@ -32,6 +31,6 @@ image_opts = "-c"
 disk_size = 16
 
 [boot_settings]
-console_type = "ttyAMA"
-console_num = "1"
+console_type = "ttyS"
+console_num = "0"
 console_speed = "115200"
