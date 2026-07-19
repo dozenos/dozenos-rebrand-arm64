@@ -82,6 +82,22 @@ add_opt() {
   fi
 }
 
+# force_opt <file> <OPTION> <y|m>: set OPTION to val UNCONDITIONALLY, replacing
+# whatever value the base defconfig had. Unlike enable_opt/add_opt this does not
+# treat a pre-existing different value as drift -- it is for boot-critical
+# drivers we must *promote* against the base (e.g. MMC is =m upstream, but the
+# eMMC host driver must be built in =y or a chroot-built initramfs, which cannot
+# detect the BF2 eMMC, would leave an installed DozenOS unable to mount root).
+force_opt() {
+  local f="$1" opt="$2" val="$3"; local base=${f##*/}
+  if grep -q "^CONFIG_${opt}=${val}\$" "$f"; then
+    echo "already forced (no-op): ${opt}=${val} [$base]"; return
+  fi
+  sed -i "/^CONFIG_${opt}=/d; /^# CONFIG_${opt} is not set\$/d" "$f"
+  printf 'CONFIG_%s=%s\n' "$opt" "$val" >> "$f"
+  echo "forced: ${opt}=${val} [$base]"
+}
+
 # require_opt <file> <regex>: dependency sanity -- these must already be on
 # in the defconfig for the options below to resolve (plan §6.3 dependency
 # table). A miss means upstream changed the base config; re-review.
@@ -127,11 +143,11 @@ enable_opt "$DEFCONFIG" MLXBF_GIGE m
 # loads but binds nothing. The eMMC holds the root filesystem, so build the
 # whole stack in (=y) -- it must be available before any initramfs. This is the
 # fix that lets an installed DozenOS boot from the DPU eMMC at all.
-add_opt "$DEFCONFIG" MMC y
-add_opt "$DEFCONFIG" MMC_BLOCK y
-add_opt "$DEFCONFIG" MMC_DW y
-add_opt "$DEFCONFIG" MMC_DW_PLTFM y
-add_opt "$DEFCONFIG" MMC_DW_BLUEFIELD y
+force_opt "$DEFCONFIG" MMC y
+force_opt "$DEFCONFIG" MMC_BLOCK y
+force_opt "$DEFCONFIG" MMC_DW y
+force_opt "$DEFCONFIG" MMC_DW_PLTFM y
+force_opt "$DEFCONFIG" MMC_DW_BLUEFIELD y
 # keep the SDHCI dwcmshc entry too (harmless; other BF variants may use it)
 enable_opt "$DEFCONFIG" MMC_SDHCI_OF_DWCMSHC m
 add_opt "$DEFCONFIG" MLXBF_TMFIFO m
