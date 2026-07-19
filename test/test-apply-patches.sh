@@ -70,6 +70,21 @@ CONFIG_MMC_SDHCI_PLTFM=m
 # CONFIG_MMC_SDHCI_OF_DWCMSHC is not set
 EOF
 
+  cat > "$lk/build-kernel.sh" <<'EOF'
+#!/bin/bash
+CWD=$(pwd)
+KERNEL_SRC=linux
+set -e
+KERNEL_VERSION=6.18.38
+KERNEL_SUFFIX=-dozenos
+echo "I: Build Debian Kernel package"
+touch .scmversion
+make bindeb-pkg BUILD_TOOLS=1 LOCALVERSION=${KERNEL_SUFFIX} KDEB_PKGVERSION=${KERNEL_VERSION}-1 -j $(getconf _NPROCESSORS_ONLN)
+
+cd $CWD
+EPHEMERAL_KERNEL_KEY=$(grep -E "^CONFIG_MODULE_SIG_KEY=" "${KERNEL_SRC}/.config")
+EOF
+
   cat > "$lk/build-mellanox-ofed.sh" <<'EOF'
 #!/bin/sh
 DROP_DEV_DBG_DEBS=1
@@ -140,7 +155,7 @@ done
 OFED="$LK/build-mellanox-ofed.sh"
 expect_line "$OFED" 'mlxver="25.01-0.6.0.0"' "§6.4 mlxver bumped"
 expect_line "$OFED" 'DRIVER_SHA1="b1aca864f457c0ef860d048e0bb862b3d7f53763"' "§6.4 sha1 bumped"
-if grep -q 'dpkg-architecture' "$OFED"; then bad "§6.4 amd64 guard removed"; else ok "§6.4 amd64 guard removed"; fi
+expect_line "$OFED" 'if ! dpkg-architecture -iamd64; then' "§6.4 amd64 guard KEPT (mlnx skips on arm64)"
 if grep -q '^if \[ ! -f x \]; then$' "$OFED"; then ok "§6.4 unrelated if-block untouched"; else bad "§6.4 unrelated if-block untouched"; fi
 absent_line "$OFED" 'rm -f SOURCES/kernel-mft_*.tar.gz' "§6.4 kernel-mft sources kept"
 absent_line "$OFED" 'rm -f SOURCES/mstflint_*.tar.gz'   "§6.4 mstflint sources kept"
@@ -148,6 +163,13 @@ absent_line "$OFED" 'rm -f SOURCES/rshim_*.tar.gz'      "§6.4 rshim sources kep
 expect_line "$OFED" 'rm -f SOURCES/openmpi_*.tar.gz' "§6.4 upstream trim survives"
 expect_line "$OFED" "  --kernel-extra-args '--with-sf-cfg-drv'" "§6.4 --kernel-extra-args added"
 if bash -n "$OFED"; then ok "§6.4 patched script parses"; else bad "§6.4 patched script parses"; fi
+
+# perf-nonfatal (build-kernel.sh)
+BK="$LK/build-kernel.sh"
+if grep -qF '__kbuild_rc' "$BK"; then ok "perf-nonfatal: guard block applied"; else bad "perf-nonfatal: guard block applied"; fi
+expect_line "$BK" 'set +e' "perf-nonfatal: set +e wraps the make"
+if grep -qF 'linux-image-${KERNEL_VERSION}${KERNEL_SUFFIX}_*.deb' "$BK"; then ok "perf-nonfatal: requires the linux-image deb"; else bad "perf-nonfatal: requires the linux-image deb"; fi
+if bash -n "$BK"; then ok "perf-nonfatal: patched build-kernel.sh parses"; else bad "perf-nonfatal: patched build-kernel.sh parses"; fi
 
 # ---------------------------------------------------------------------------
 # Run 2: idempotency -- second run byte-identical.
@@ -213,6 +235,26 @@ if "$SCRIPT" "$WORK/tree-drift5" >/dev/null 2>&1; then
   bad "missing build-mellanox-ofed.sh: expected non-zero exit"
 else
   ok "missing build-mellanox-ofed.sh: dies loudly"
+fi
+
+make_fixture "$WORK/tree-drift6"
+# upstream removed the amd64 guard -> ofed patch must die (mlnx would fail on arm64)
+sed -i '/if ! dpkg-architecture -iamd64; then/,/^fi$/d' \
+  "$WORK/tree-drift6/scripts/package-build/linux-kernel/build-mellanox-ofed.sh"
+if "$SCRIPT" "$WORK/tree-drift6" >/dev/null 2>&1; then
+  bad "ofed guard already gone: expected non-zero exit"
+else
+  ok "ofed guard already gone: dies loudly"
+fi
+
+make_fixture "$WORK/tree-drift7"
+# upstream changed the bindeb-pkg make line -> perf-nonfatal must die
+sed -i 's/^make bindeb-pkg .*/make bindeb-pkg SOMETHING_ELSE/' \
+  "$WORK/tree-drift7/scripts/package-build/linux-kernel/build-kernel.sh"
+if "$SCRIPT" "$WORK/tree-drift7" >/dev/null 2>&1; then
+  bad "perf-nonfatal anchor drift: expected non-zero exit"
+else
+  ok "perf-nonfatal anchor drift: dies loudly"
 fi
 
 # ---------------------------------------------------------------------------

@@ -4,17 +4,22 @@
 # build-mellanox-ofed.sh (BF2-FLOWTABLE-OFFLOAD-PLAN.md §6.4):
 #
 #   - MLNX_OFED 24.07-0.6.1.0 -> 25.01-0.6.0.0 (+ matching source SHA1)
-#   - drop the amd64-only guard (confirmed false alert -- the arm64 build
-#     works; the guard would silently skip the whole build on the DPU arch)
 #   - keep the kernel-mft / mstflint / rshim SOURCES tarballs (BlueField
 #     tools) instead of deleting them before install.pl runs
 #   - pass --kernel-extra-args '--with-sf-cfg-drv' (SF configuration driver)
 #
-# FALLBACK-ONLY: the in-tree mlx5 of kernel 6.18 is the main driver (plan
-# §5) and the arm64 nightly does NOT build the mlnx unit. This script keeps
-# the OFED recipe buildable for userland tools (mstflint/rshim/mft) and as
-# the escape hatch if in-tree FT offload shows a real bug on BF2. OFED
-# 25.01 kernel modules are not expected to compile against 6.18.
+# The amd64-only guard is deliberately KEPT (not removed as the plan's §6.4
+# draft suggested): build.py builds every package.toml recipe including mlnx
+# with no --packages filter, and on the arm64 nightly we want mlnx to SKIP
+# cleanly (the guard exits 0 on non-amd64) rather than download the OFED
+# tarball and fail-build against kernel 6.18 -- in-tree mlx5 is the primary
+# driver (plan §5), OFED OOT modules are NOT shipped, and OFED 25.01 is not
+# expected to compile against 6.18 anyway. The version/sources/sf-cfg-drv
+# edits below are FALLBACK-PREP only: they live in the recipe for the day
+# someone does a MANUAL out-of-tree OFED build (userland mstflint/rshim/mft,
+# or pinning to an OFED-supported LTS kernel per plan §5), where the guard
+# is removed by hand for that one-off build. Removing it here would only add
+# a noisy, time-wasting fail-build to every arm64 nightly.
 #
 # Idempotent; dies loudly on upstream drift.
 #
@@ -54,15 +59,12 @@ else
   die "DRIVER_SHA1 line has neither the expected nor the patched value (upstream drift) -- re-review by hand"
 fi
 
-if grep -q '^if ! dpkg-architecture -iamd64; then$' "$OFED"; then
-  perl -0pi -e 's/if ! dpkg-architecture -iamd64; then\n[^\n]*\n[^\n]*\nfi\n\n//' "$OFED"
-  grep -q 'dpkg-architecture -iamd64' "$OFED" && die "amd64 guard removal left a residue -- re-review by hand"
-  echo "removed the amd64-only guard"
-elif grep -q 'dpkg-architecture' "$OFED"; then
-  die "unexpected dpkg-architecture usage remains (upstream drift) -- re-review by hand"
-else
-  echo "already removed (idempotent no-op): amd64 guard"
-fi
+# The amd64-only guard is intentionally KEPT (see header). Assert it is still
+# there so a future upstream removal of the guard is caught here rather than
+# silently letting mlnx fail-build on every arm64 nightly.
+grep -q '^if ! dpkg-architecture -iamd64; then$' "$OFED" \
+  || die "the amd64-only guard is gone from build-mellanox-ofed.sh (upstream drift) -- re-review by hand: mlnx would now fail-build on arm64"
+echo "kept the amd64-only guard (mlnx skips cleanly on the arm64 nightly)"
 
 for keep in kernel-mft mstflint rshim; do
   if grep -qxF "rm -f SOURCES/${keep}_*.tar.gz" "$OFED"; then
