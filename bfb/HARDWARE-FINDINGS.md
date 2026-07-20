@@ -175,10 +175,50 @@ implementation exists, diff against it early.
    `bfbootmgr --cleanall` before giving up;
 5. unmount efivarfs and reboot.
 
-Deliberately **not** done in the installed image: NVIDIA enables gettys by
-`chroot /mnt systemctl enable serial-getty@{ttyAMA0,ttyAMA1,hvc0}`, but DozenOS
-derives its getty from `console=` on the kernel cmdline, so no image-side change
-is needed — and dozenos-build stays untouched.
+### Serial login needs BOTH the cmdline and config.boot
+
+`console=` alone does **not** give DozenOS a login prompt. Observed on hardware
+with `console=ttyAMA0`: systemd's getty-generator does start
+`serial-getty@ttyAMA0`, the UART carries output all the way to
+`Configuration success` (so the earlier "the UART dies in early userspace"
+reading was wrong — it simply had nothing left to print), and yet no `login:`
+is ever emitted. Cause: DozenOS takes its serial console from `system console
+device` in **config.boot**, and the image's `config.boot.default` has no
+`console` section at all — `getty.target.wants/` ships only `getty@tty1`. Once
+`dozenos-router` applies the config (~80 s in) the config owns console
+management and the generator-spawned getty produces nothing.
+
+So the flavor sets `console_type = "ttyAMA"` (GRUB cmdline) **and** the
+installer seeds config.boot:
+
+```
+system {
+    console {
+        device ttyAMA0 {
+            speed "115200"
+        }
+    }
+}
+```
+
+config.boot is the *entire* configuration when present, so the installer builds
+it from the image's own `config.boot.default` (read out of the squashfs on the
+freshly flashed disk) with the console block inserted, and writes it to
+`boot/<version>/rw/opt/vyatta/etc/config/config.boot` — the union-mount
+writable layer named by `persistence.conf` (`/ union`).
+
+**INTERIM — this should move into `config.boot.default` proper.** It sits in
+the installer only because that file ships in the *dozenos-1x package*, so
+overriding it would change every arm64 flavor rather than only the DPU. The
+sanctioned place to do that when the time comes is a
+`dozenos-rebrand-arm64/patches/` script writing
+`includes.chroot/usr/share/dozenos/config.boot.default` — that layer patches a
+CI checkout and is never pushed back, so dozenos-build's integrity is
+preserved either way.
+
+NVIDIA solves the same problem differently, via
+`chroot /mnt systemctl enable serial-getty@{ttyAMA0,ttyAMA1,hvc0}` — which does
+not transfer, since a DozenOS root is a read-only squashfs.
 
 ## 2026-07-20 session — earlier state (superseded by the section above)
 
