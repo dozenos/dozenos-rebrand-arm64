@@ -38,9 +38,12 @@ release asset: dozenos-<ver>-bf2.bfb   (bootable BFB)
 
 ## In flight
 
-- **nightly run 29712072349** (re-triggered after dropping PTM/IPMB) — building
-  `linux-kernel` with `MMC_DW_BLUEFIELD=y`. ~1h15m. On success bfb.yml auto-runs.
-- Being watched by a background monitor (relaunched each 10-min window).
+- **nightly run 29713167773** — building `linux-kernel` with
+  `MMC_DW_BLUEFIELD=y` + `MLXBF_TMFIFO=y` (rshim hvc0 console usable in the
+  installer/early boot) + `EFIVAR_FS=y` (installer efibootmgr needs efivars
+  pre-modules; Kconfig default was =m). Run 29712072349 was cancelled to fold
+  these in — one kernel rebuild instead of two. ~1h15m; on success bfb.yml
+  auto-runs.
 
 ## Commits (all pushed)
 
