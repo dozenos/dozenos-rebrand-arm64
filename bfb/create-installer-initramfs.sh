@@ -248,6 +248,59 @@ else
 fi
 [ "$efivars_mount" = 1 ] && umount /sys/firmware/efi/efivars 2>/dev/null
 
+# Seed the installed system's config.boot with a serial console.
+#
+# INTERIM -- this belongs in config.boot proper (i.e. shipped in the image's
+# config.boot.default) rather than being injected by the installer. It lives
+# here for now because that file comes from the dozenos-1x package and putting
+# a DPU console into it would change every arm64 flavor, not just the DPU.
+#
+# Why it is needed at all: DozenOS derives its serial getty from `system
+# console device` in config.boot, NOT from the kernel cmdline. systemd's
+# getty-generator does start serial-getty@ttyAMA0 from console=ttyAMA0, but
+# once the config is applied (dozenos-router, ~80 s in) the config takes over
+# console management and no login prompt is ever printed -- observed on
+# hardware: full boot to "Configuration success", UART carrying output the
+# whole time, and no `login:` anywhere.
+#
+# config.boot is the WHOLE configuration when present, so seed it from the
+# image's own config.boot.default with the console block inserted, rather than
+# writing a fragment.
+seed_console_config() {
+  local ver_dir sq def dst
+  mkdir -p /mnt/root /mnt/sq
+  mount "${TGT}p3" /mnt/root 2>/dev/null || { say "W: console seed: cannot mount ${TGT}p3"; return 1; }
+  sq=$(ls /mnt/root/boot/*/*.squashfs 2>/dev/null | head -1)
+  [ -n "$sq" ] || { say "W: console seed: no squashfs found"; umount /mnt/root; return 1; }
+  ver_dir=$(dirname "$sq")
+  mount -t squashfs -o loop,ro "$sq" /mnt/sq 2>/dev/null || { say "W: console seed: cannot mount squashfs"; umount /mnt/root; return 1; }
+  def=/mnt/sq/usr/share/dozenos/config.boot.default
+  dst="$ver_dir/rw/opt/vyatta/etc/config/config.boot"
+  if [ -f "$def" ]; then
+    mkdir -p "$(dirname "$dst")"
+    awk '
+      /^system \{$/ && !done {
+        print
+        print "    console {"
+        print "        device ttyAMA0 {"
+        print "            speed \"115200\""
+        print "        }"
+        print "    }"
+        done = 1
+        next
+      }
+      { print }
+    ' "$def" > "$dst"
+    chmod 0660 "$dst" 2>/dev/null || true
+    say "I: seeded config.boot with console device ttyAMA0"
+  else
+    say "W: console seed: $def not found"
+  fi
+  umount /mnt/sq 2>/dev/null
+  umount /mnt/root 2>/dev/null
+}
+seed_console_config || say "W: config.boot console seeding failed; login may be unavailable on ttyAMA0"
+
 # Drop the install log onto the freshly-written ESP so it is readable from the
 # installed system / EFI shell even when no console was attached.
 esp_err=$(mount -t vfat "${TGT}p2" /mnt 2>&1)

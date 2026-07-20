@@ -16,10 +16,12 @@
 # 16/32/64 GB). dd of a 16 GB image onto a smaller eMMC fails; onto a larger
 # one it leaves the tail unused (fine for bring-up). Tune to your board.
 #
-# console: the BF2 rshim console (`screen /dev/rshim0/console`) is the TMFIFO
-# virtio console = hvc0 (NVIDIA BSP; confirmed -- the stock eMMC Ubuntu login
-# appeared on hvc0 via rshim). The installed DozenOS puts its getty/login on
-# hvc0 so it is reachable over rshim after eMMC boot.
+# console: ttyAMA0 is the BF2 UART reaching the DPU BMC's console server
+# (`ssh -p 2200 root@<bmc>`), and DozenOS derives its getty from whatever
+# `console=` GRUB puts on the cmdline -- so this is what makes the installed
+# system loginable. hvc0 (the rshim TMFIFO console) is deliberately NOT the
+# choice here: it depends on MLXBF_TMFIFO being up and has not proven reliable
+# on this hardware, whereas ttyAMA0 carries output from firmware onwards.
 #
 # rshim is deliberately NOT installed: it is a HOST-side driver (pushes boot
 # streams / serves the tmfifo console+net from the host). The DPU side is
@@ -32,6 +34,6 @@ image_opts = "-c"
 disk_size = 16
 
 [boot_settings]
-console_type = "hvc"
+console_type = "ttyAMA"
 console_num = "0"
 console_speed = "115200"
