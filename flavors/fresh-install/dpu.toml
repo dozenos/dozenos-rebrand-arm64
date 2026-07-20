@@ -1,12 +1,18 @@
-# BlueField-2 DPU disk image.
+# BlueField-2 DPU images: a fully-installed disk image, plus the ISO.
 #
-# Produces a fully-installed disk image (EFI + root, squashfs + GRUB already
-# laid down by raw_image.py) -- NOT a live ISO. First boot comes up already
-# installed, no interactive `install image` step. The BFB wrap job (bfb/)
-# converts this to raw and flashes it onto the DPU eMMC with dd; you can
-# also do it by hand:
+# The qcow2 is a fully-installed disk (EFI + root, squashfs + GRUB already laid
+# down by raw_image.py) -- first boot comes up installed, with no interactive
+# `install image` step. The BFB wrap job (bfb/) flashes it onto the DPU eMMC;
+# by hand it would be:
 #     qemu-img convert -f qcow2 -O raw dozenos-*-dpu-arm64.qcow2 disk.raw
 #     dd if=disk.raw of=/dev/mmcblk0 bs=4M   # on the DPU, from the installer
+#
+# The ISO is for `add system image` on a DPU that is already running DozenOS --
+# an in-system upgrade, no reflash and no host access needed. It costs nothing
+# to publish: the build produces an ISO first regardless and derives the raw
+# and qcow2 from it, so listing "iso" here only stops it being filtered out of
+# the release. There is no separate upgrade/ flavor because the DPU carries no
+# cloud-init, which is the only thing the aws split exists to leave out.
 #
 # qcow2 (compressed) rather than a bare raw: a raw sized to the eMMC would be
 # a multi-GB release asset (GitHub does not sparse-compress assets), whereas
@@ -28,7 +34,7 @@
 # reachable via the in-tree MLXBF_TMFIFO (tmfifo_net0 + console) and
 # MLXBF_GIGE (OOB port) drivers enabled in the arm64 kernel config.
 
-image_format = ["qcow2"]
+image_format = ["qcow2", "iso"]
 image_opts = "-c"
 
 disk_size = 16
