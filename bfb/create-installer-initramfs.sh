@@ -103,7 +103,7 @@ if [ ! -e "$root/lib/ld-linux-aarch64.so.1" ]; then
   ld=$(find "$LIBDIR" /lib -name 'ld-linux-aarch64.so.1' 2>/dev/null | head -1)
   [ -n "$ld" ] && { mkdir -p "$root/lib"; cp "$ld" "$root/lib/ld-linux-aarch64.so.1"; }
 fi
-echo "I: bundled efibootmgr + pv with $(find "$root/lib" "$root/usr/lib" -name '*.so*' 2>/dev/null | wc -l) shared libs"
+echo "I: bundled efibootmgr + qemu-img with $(find "$root/lib" "$root/usr/lib" -name '*.so*' 2>/dev/null | wc -l) shared libs"
 
 # --- optional modular-eMMC fallback -----------------------------------------
 # MMC_DW_BLUEFIELD is =y in the DozenOS kernel so this is normally unused, but
