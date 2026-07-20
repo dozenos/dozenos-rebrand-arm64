@@ -117,7 +117,70 @@ INFO[MISC]: Ubuntu installation completed
 Same "write an OS image to eMMC then reboot" model as our dd installer.
 `bfb-install --bfb <f> [--config bf.cfg] [--rootfs rootfs.tar.xz] --rshim rshim0`.
 
-## 2026-07-20 session — install and boot work; three new blockers
+## 2026-07-20 — the full chain works end to end
+
+A single controlled push (one `bfb-install`, both console readers started
+*before* the push, no resets) took the board from a stock-Ubuntu eMMC to a
+self-booting DozenOS:
+
+```
+I: ===== FLASH COMPLETE =====
+I: registering UEFI boot entry for DozenOS...
+I: boot entry registered:
+BootCurrent: 0019
+BootOrder: 001A,0014,0000,0001,0002,...
+I: done. Rebooting into installed DozenOS in 5s.
+[   38.833965] reboot: Restarting system
+… Booting `2026.07.20-0245-rolling'
+```
+
+- **Install → boot → auto-boot → boot entry**: all four work, unattended.
+- **`BootCurrent: 0019`** is the decisive number: the installer itself booted
+  from the rshim entry *while Ubuntu's `Boot0014` sat ahead of it in BootOrder*.
+  Pushing a BFB takes precedence over the installed OS, full stop.
+- **`BootOrder: 001A,…`** — `efibootmgr -c` prepends, so the new DozenOS entry
+  leads the order exactly like Ubuntu's installer does.
+- **Install takes ~34 s** (`Run /init` at 4.86 s, `reboot` at 38.83 s), down
+  from ~7 minutes, since `qemu-img convert -n` writes only allocated clusters.
+
+### Three earlier conclusions, all now disproven
+
+Recorded because each cost real time and each looked well-evidenced:
+
+1. **"A valid NVRAM boot entry blocks BFB re-flashing."** Wrong — see
+   `BootCurrent: 0019` above, and a stock NVIDIA BFB flashed fine on this board
+   under the same NVRAM state. The original evidence (v2 installed, v3 did not)
+   was a symptom of #2, not of boot ordering.
+2. **"The BFB/rshim boot path has no EFI runtime, so efibootmgr can never work
+   there."** Wrong — it works. What actually mattered was *when* efivarfs is
+   mounted: mounting it once at the top of `/init` returned ENODEV, while
+   mounting it at the point of use — NVIDIA's own sequence — succeeds.
+3. **"Our BFB packaging is defective."** Wrong — a byte-level `mlx-mkbfb -x`
+   comparison had already shown every boot-governing image identical to stock,
+   and the hardware now agrees.
+
+The lesson worth keeping: the fix came from reading NVIDIA's installer
+(`ubuntu/install.sh:update_efi_bootmgr`, extracted from the stock bf-bundle
+initramfs) rather than from reasoning about the firmware. When a reference
+implementation exists, diff against it early.
+
+### What the installer now does (mirroring NVIDIA)
+
+1. flash with `qemu-img convert -n -p -f qcow2 -O raw` onto `/dev/mmcblk0`;
+2. `blockdev --rereadpt` — the kernel still holds the *previous* OS's partition
+   table, so `p2` would otherwise resolve to the old ESP offset;
+3. `mount -t efivarfs none /sys/firmware/efi/efivars` **at the point of use**;
+4. delete any existing entry with our label, `efibootmgr -c -d /dev/mmcblk0
+   -p 2 -L DozenOS -l '\EFI\BOOT\BOOTAA64.EFI'`, verify, retry, and fall back to
+   `bfbootmgr --cleanall` before giving up;
+5. unmount efivarfs and reboot.
+
+Deliberately **not** done in the installed image: NVIDIA enables gettys by
+`chroot /mnt systemctl enable serial-getty@{ttyAMA0,ttyAMA1,hvc0}`, but DozenOS
+derives its getty from `console=` on the kernel cmdline, so no image-side change
+is needed — and dozenos-build stays untouched.
+
+## 2026-07-20 session — earlier state (superseded by the section above)
 
 ### What is proven working
 
@@ -209,7 +272,7 @@ v0, boot-args v0+v2, kernel v0, initramfs v0 — no missing image explains it, s
 the open question is how the firmware *orders* the rshim entry, not whether it
 exists.
 
-### Blocker 3 — no usable login on the installed system
+### Blocker 3 — no usable login on the installed system (rig-specific)
 
 | Path | Behaviour |
 |------|-----------|
