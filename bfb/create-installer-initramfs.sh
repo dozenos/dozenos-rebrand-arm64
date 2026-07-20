@@ -45,7 +45,7 @@ set -euo pipefail
 die() { printf 'create-installer-initramfs: %s\n' "$*" >&2; exit 2; }
 need() { command -v "$1" >/dev/null 2>&1 || die "missing tool: $1"; }
 
-DISK="" BUSYBOX="" OUT="" MODDIR="" KVER=""
+DISK="" BUSYBOX="" OUT="" MODDIR="" KVER="" CFGDEFAULT=""
 while [ $# -gt 0 ]; do
   case "$1" in
     --disk)        DISK="${2:?}"; shift 2 ;;
@@ -53,6 +53,7 @@ while [ $# -gt 0 ]; do
     --out)         OUT="${2:?}"; shift 2 ;;
     --modules-dir) MODDIR="${2:?}"; shift 2 ;;
     --kver)        KVER="${2:?}"; shift 2 ;;
+    --config-boot-default) CFGDEFAULT="${2:?}"; shift 2 ;;
     -h|--help)     sed -n '2,40p' "${BASH_SOURCE[0]}" | sed 's/^# \{0,1\}//'; exit 0 ;;
     *)             die "unknown argument: $1" ;;
   esac
@@ -112,7 +113,8 @@ if [ -n "$MODDIR" ] && [ -d "$MODDIR" ]; then
   # efivarfs + vfat (+ nls deps): the DozenOS kernel builds these =m, and the
   # installer needs them for efibootmgr (efivars) and the on-ESP install log.
   for name in dw_mmc dw_mmc-pltfm dw_mmc-bluefield mmc_core mmc_block \
-              efivarfs fat vfat nls_cp437 nls_iso8859-1 nls_ascii; do
+              efivarfs fat vfat nls_cp437 nls_iso8859-1 nls_ascii \
+              crc16 mbcache jbd2 ext4; do
     while IFS= read -r ko; do
       [ -n "$ko" ] || continue; base=$(basename "$ko")
       case "$base" in
@@ -131,6 +133,30 @@ fi
 # only allocated clusters are written and zero regions become BLKZEROOUT
 # requests, so a mostly-empty 16 GB image no longer costs 16 GB of eMMC
 # writes (and minutes of dd time) per install.
+# --- config.boot with a serial console, generated here -----------------------
+# Built on the runner rather than on the DPU: the installed root is ext4 and
+# its OS lives in a squashfs, and squashfs/loop are modules the installer
+# initramfs would otherwise have to carry just to read one file. Generating it
+# here leaves the installer needing only ext4 to drop the finished file in.
+if [ -n "$CFGDEFAULT" ] && [ -f "$CFGDEFAULT" ]; then
+  awk '
+    /^system \{$/ && !done {
+      print
+      print "    console {"
+      print "        device ttyAMA0 {"
+      print "            speed \"115200\""
+      print "        }"
+      print "    }"
+      done = 1
+      next
+    }
+    { print }
+  ' "$CFGDEFAULT" > "$root/config.boot"
+  grep -q 'device ttyAMA0' "$root/config.boot" \
+    || die "config.boot console injection produced no console stanza -- upstream format drift?"
+  echo "I: generated config.boot with console device ttyAMA0"
+fi
+
 if qemu-img info "$DISK" 2>/dev/null | grep -qi 'file format: qcow2'; then
   cp "$DISK" "$root/disk.qcow2"
 else
@@ -267,36 +293,22 @@ fi
 # image's own config.boot.default with the console block inserted, rather than
 # writing a fragment.
 seed_console_config() {
-  local ver_dir sq def dst
-  mkdir -p /mnt/root /mnt/sq
-  mount "${TGT}p3" /mnt/root 2>/dev/null || { say "W: console seed: cannot mount ${TGT}p3"; return 1; }
-  sq=$(ls /mnt/root/boot/*/*.squashfs 2>/dev/null | head -1)
-  [ -n "$sq" ] || { say "W: console seed: no squashfs found"; umount /mnt/root; return 1; }
-  ver_dir=$(dirname "$sq")
-  mount -t squashfs -o loop,ro "$sq" /mnt/sq 2>/dev/null || { say "W: console seed: cannot mount squashfs"; umount /mnt/root; return 1; }
-  def=/mnt/sq/usr/share/dozenos/config.boot.default
-  dst="$ver_dir/rw/opt/vyatta/etc/config/config.boot"
-  if [ -f "$def" ]; then
-    mkdir -p "$(dirname "$dst")"
-    awk '
-      /^system \{$/ && !done {
-        print
-        print "    console {"
-        print "        device ttyAMA0 {"
-        print "            speed \"115200\""
-        print "        }"
-        print "    }"
-        done = 1
-        next
-      }
-      { print }
-    ' "$def" > "$dst"
-    chmod 0660 "$dst" 2>/dev/null || true
-    say "I: seeded config.boot with console device ttyAMA0"
-  else
-    say "W: console seed: $def not found"
+  [ -f /config.boot ] || { say "W: console seed: no /config.boot in the initramfs"; return 1; }
+  mkdir -p /mnt/root
+  mnt_err=$(mount -t ext4 "${TGT}p3" /mnt/root 2>&1)
+  if ! mount | grep -q "${TGT}p3"; then
+    say "W: console seed: cannot mount ${TGT}p3 ($mnt_err)"
+    return 1
   fi
-  umount /mnt/sq 2>/dev/null
+  ver_dir=$(ls -d /mnt/root/boot/*/ 2>/dev/null | head -1)
+  if [ -z "$ver_dir" ]; then
+    say "W: console seed: no boot/<version>/ on ${TGT}p3"
+    umount /mnt/root; return 1
+  fi
+  dst="${ver_dir}rw/opt/vyatta/etc/config/config.boot"
+  mkdir -p "$(dirname "$dst")"
+  cp /config.boot "$dst" && chmod 0660 "$dst" 2>/dev/null
+  say "I: seeded config.boot (console ttyAMA0) at ${dst#/mnt/root}"
   umount /mnt/root 2>/dev/null
 }
 seed_console_config || say "W: config.boot console seeding failed; login may be unavailable on ttyAMA0"
