@@ -150,7 +150,12 @@ force_opt "$DEFCONFIG" MMC_DW_PLTFM y
 force_opt "$DEFCONFIG" MMC_DW_BLUEFIELD y
 # keep the SDHCI dwcmshc entry too (harmless; other BF variants may use it)
 enable_opt "$DEFCONFIG" MMC_SDHCI_OF_DWCMSHC m
-add_opt "$DEFCONFIG" MLXBF_TMFIFO m
+# MLXBF_TMFIFO drives hvc0 (the rshim console) -- built in so the installer
+# initramfs and early boot are visible over /dev/rshim0/console.
+force_opt "$DEFCONFIG" MLXBF_TMFIFO y
+# efivarfs defaults to =m (absent from the defconfig) but the installer's
+# efibootmgr needs it before any module loading.
+force_opt "$DEFCONFIG" EFIVAR_FS y
 add_opt "$DEFCONFIG" MLXBF_BOOTCTL m
 add_opt "$DEFCONFIG" MLXBF_PMC m
 add_opt "$DEFCONFIG" GPIO_MLXBF2 m
