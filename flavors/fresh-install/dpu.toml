@@ -34,7 +34,7 @@
 # reachable via the in-tree MLXBF_TMFIFO (tmfifo_net0 + console) and
 # MLXBF_GIGE (OOB port) drivers enabled in the arm64 kernel config.
 
-image_format = ["qcow2", "iso"]
+image_format = ["iso", "qcow2"]
 image_opts = "-c"
 
 disk_size = 16
