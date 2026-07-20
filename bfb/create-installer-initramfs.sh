@@ -6,19 +6,20 @@
 #
 # The initramfs boots on the DPU ARM cores from the BFB. Its whole job:
 #   1. wait for the eMMC to appear (/dev/mmcblk0),
-#   2. block-copy a pre-installed DozenOS disk image onto it (`dd`),
+#   2. flash a pre-installed DozenOS disk image onto it
+#      (qemu-img convert -n: allocated clusters only, zeros as BLKZEROOUT),
 #   3. register a UEFI boot entry for the freshly-written ESP (efibootmgr),
 #   4. reboot into the installed DozenOS.
 # The disk image already has GPT + ESP + GRUB + squashfs (raw_image.py did the
-# real install), so there is NO distro-aware install logic -- a plain dd, which
-# is what makes this robust for VyOS/DozenOS.
+# real install), so there is NO distro-aware install logic -- a plain block
+# copy, which is what makes this robust for VyOS/DozenOS.
 #
 # Hardware facts this encodes (all confirmed on a BF2):
 #  - eMMC = Synopsys DesignWare (dw_mmc-bluefield, ACPI PRP0001), NOT sdhci. In
 #    the DozenOS kernel MMC_DW_BLUEFIELD is built in (=y), so /dev/mmcblk0
 #    appears on its own -- no module loading needed. A modules dir may still be
 #    passed as a fallback for a modular kernel.
-#  - busybox has gzip/zcat but no zstd, so the disk image is shipped gzip'd.
+#  - the disk image ships as qcow2; bundled qemu-img writes it out directly.
 #  - after dd the old UEFI boot entries are stale (changed partition GUIDs), so
 #    UEFI drops to PXE unless we add an entry -> efibootmgr creates one pointing
 #    at the DozenOS ESP (partition 2, \EFI\BOOT\BOOTAA64.EFI).
@@ -26,8 +27,8 @@
 # Layout of the produced initramfs (a gzip'd cpio):
 #   /init            -- the installer (below)
 #   /bin/busybox     -- static arm64 busybox
-#   /usr/bin/{efibootmgr,pv} + /lib/*.so* -- dynamic tools + their glibc deps
-#   /disk.img.gz     -- the DozenOS disk image, gzip-compressed
+#   /usr/bin/{efibootmgr,qemu-img} + /lib/*.so* -- dynamic tools + glibc deps
+#   /disk.qcow2      -- the DozenOS disk image (qcow2, compressed)
 #   /lib/modules/... -- optional eMMC host .ko fallback (only if --modules-dir)
 #
 # Usage:
@@ -38,7 +39,7 @@
 #       [--modules-dir <linux-image /lib/modules/<kver>>] [--kver <release>]
 #
 # Runs on an arm64 host (the arm64 CI runner): it copies the runner's own glibc
-# for efibootmgr/pv and apt-fetches efibootmgr/pv/libefivar when absent.
+# for the bundled tools and apt-fetches efibootmgr/qemu-utils when absent.
 set -euo pipefail
 
 die() { printf 'create-installer-initramfs: %s\n' "$*" >&2; exit 2; }
@@ -81,9 +82,9 @@ fetch_tool() {
   command -v "$bin" 2>/dev/null || true
 }
 EFIBM=$(fetch_tool efibootmgr efibootmgr)
-PV=$(fetch_tool pv pv)
+QIMG=$(fetch_tool qemu-utils qemu-img)
 [ -n "$EFIBM" ] || die "efibootmgr unavailable (apt-get install efibootmgr failed)"
-[ -n "$PV" ]    || die "pv unavailable (apt-get install pv failed)"
+[ -n "$QIMG" ]  || die "qemu-img unavailable (apt-get install qemu-utils failed)"
 
 copy_with_libs() {
   local bin="$1" dst="$2"
@@ -96,7 +97,7 @@ copy_with_libs() {
   done
 }
 copy_with_libs "$EFIBM" "$root/usr/bin/efibootmgr"
-copy_with_libs "$PV" "$root/usr/bin/pv"
+copy_with_libs "$QIMG" "$root/usr/bin/qemu-img"
 # the ELF interpreter path is /lib/ld-linux-aarch64.so.1; make sure it exists there
 if [ ! -e "$root/lib/ld-linux-aarch64.so.1" ]; then
   ld=$(find "$LIBDIR" /lib -name 'ld-linux-aarch64.so.1' 2>/dev/null | head -1)
@@ -122,15 +123,17 @@ if [ -n "$MODDIR" ] && [ -d "$MODDIR" ]; then
   echo "I: staged fallback modules: $(ls "$root/lib/modules" 2>/dev/null | tr '\n' ' ')"
 fi
 
-# --- the disk image: raw -> gzip --------------------------------------------
+# --- the disk image: ship as qcow2 ------------------------------------------
+# The installer flashes with `qemu-img convert -n` straight onto the eMMC:
+# only allocated clusters are written and zero regions become BLKZEROOUT
+# requests, so a mostly-empty 16 GB image no longer costs 16 GB of eMMC
+# writes (and minutes of dd time) per install.
 if qemu-img info "$DISK" 2>/dev/null | grep -qi 'file format: qcow2'; then
-  echo "I: converting qcow2 -> raw"
-  qemu-img convert -f qcow2 -O raw "$DISK" "$WORK/disk.raw"; SRC="$WORK/disk.raw"
+  cp "$DISK" "$root/disk.qcow2"
 else
-  SRC="$DISK"
+  echo "I: converting raw -> compressed qcow2"
+  qemu-img convert -f raw -O qcow2 -c "$DISK" "$root/disk.qcow2"
 fi
-echo "I: gzip-compressing the disk image into the initramfs"
-gzip -1 -c "$SRC" > "$root/disk.img.gz"
 
 cat > "$root/init" <<'INIT'
 #!/bin/busybox sh
@@ -174,12 +177,10 @@ if [ ! -b "$TGT" ]; then
 fi
 
 say "I: flashing DozenOS onto $TGT (this wipes it)..."
-SIZE=$(gzip -l /disk.img.gz 2>/dev/null | awk 'NR==2{print $2}')
-if command -v pv >/dev/null 2>&1 && [ -n "$SIZE" ]; then
-  zcat /disk.img.gz | pv -s "$SIZE" | dd of="$TGT" bs=4M conv=fsync 2>/dev/null
-else
-  zcat /disk.img.gz | dd of="$TGT" bs=4M conv=fsync 2>&1
-fi || { say "E: dd failed -- shell."; exec /bin/busybox sh; }
+# -n: write into the existing device; allocated clusters are written, zero
+# clusters are pushed down as zero-out requests instead of 16 GB of data.
+qemu-img convert -n -p -f qcow2 -O raw /disk.qcow2 "$TGT" \
+  || { say "E: qemu-img convert failed -- shell."; exec /bin/busybox sh; }
 say "I: ===== FLASH COMPLETE ====="
 # fix the backup GPT to the real (larger) eMMC end -- best effort
 command -v sgdisk >/dev/null 2>&1 && sgdisk -e "$TGT" 2>/dev/null || true
