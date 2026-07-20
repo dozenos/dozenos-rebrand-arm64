@@ -187,6 +187,12 @@ say "I: ===== FLASH COMPLETE ====="
 # fix the backup GPT to the real (larger) eMMC end -- best effort
 command -v sgdisk >/dev/null 2>&1 && sgdisk -e "$TGT" 2>/dev/null || true
 sync
+# The kernel enumerated the partitions of whatever OS was on the eMMC before
+# this install, so ${TGT}p* still describe the OLD layout and would mount the
+# wrong offsets. Force a re-read of the table we just wrote.
+blockdev --rereadpt "$TGT" 2>/dev/null || true
+mdev -s 2>/dev/null || true
+for i in $(seq 1 10); do [ -b "${TGT}p2" ] && break; sleep 1; mdev -s 2>/dev/null || true; done
 
 # Register a UEFI boot entry for the DozenOS ESP so the DPU boots it without a
 # manual EFI-shell step. The DozenOS image ESP is partition 2 with the
@@ -244,14 +250,14 @@ fi
 
 # Drop the install log onto the freshly-written ESP so it is readable from the
 # installed system / EFI shell even when no console was attached.
-mdev -s 2>/dev/null || true
-if mount -t vfat "${TGT}p2" /mnt 2>/dev/null; then
+esp_err=$(mount -t vfat "${TGT}p2" /mnt 2>&1)
+if [ -z "$esp_err" ] && mountpoint -q /mnt 2>/dev/null || mount | grep -q "${TGT}p2"; then
   dmesg | tail -40 >> $LOG 2>/dev/null || true
   cp $LOG /mnt/dozenos-install.log 2>/dev/null || true
   umount /mnt
   say "I: install log written to ESP:/dozenos-install.log"
 else
-  say "W: could not mount ${TGT}p2; install log not persisted"
+  say "W: could not mount ${TGT}p2 ($esp_err); install log not persisted"
 fi
 
 sync
