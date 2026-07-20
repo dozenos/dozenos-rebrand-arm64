@@ -6,12 +6,15 @@ behaves. Kept as the source of truth for `bfb/` and `bfb.yml` fixes.
 
 ## Test rig topology
 
-- **VM `bf1` (172.30.0.138)** = x86-64 build/staging host. The BF2 is PCIe
-  passed-through; the VM talks to it via **rshim** (`/dev/rshim0/{boot,console,misc}`).
-  So `busybox`/kernels *for the DPU are arm64* and cannot be run on the VM.
-- **DPU BMC (OpenBMC)** — IP moved 172.30.0.139 → **172.30.0.142** after a BMC
-  firmware flash. Default creds **`root` / `0penBmc`** (documented default, not
-  changed on this unit).
+- **VM `bf1`** = x86-64 build/staging host (172.30.0.138, **172.30.0.160** as of
+  2026-07-20). The BF2 is PCIe passed-through; the VM talks to it via **rshim**
+  (`/dev/rshim0/{boot,console,misc}`). So `busybox`/kernels *for the DPU are
+  arm64* and cannot be run on the VM.
+- **DPU BMC (OpenBMC)** — IP moved 172.30.0.139 → 172.30.0.142 →
+  **172.30.0.159** (2026-07-20). Default creds **`root` / `0penBmc`**
+  (documented default, not changed on this unit). BMC-side console server is
+  `obmc-console@ttyS0`; port 2200 is the only listener (2201 has a client
+  config but no socket).
 - **Host serial console via BMC** = `ssh -p 2200 root@<bmc>` (obmc-console).
   Use SSH port 2200, **not** IPMI SoL (IPMI RAKP auth is broken on this unit).
 
@@ -92,11 +95,13 @@ the eMMC holds root). `MMC_SDHCI_OF_DWCMSHC=m` is kept but is not the BF2 driver
 - `CONFIG_EFI_STUB=y`, `CONFIG_EFI=y`, `CONFIG_RELOCATABLE=y`; PE header is a
   valid arm64 EFI app (same structure as NVIDIA's). Page size (4K) is **not**
   the problem (4K BF images exist).
-- Symptom: with our BFB it never prints the EFI-stub line and hangs after
-  `HW watchdog disab…`. Because that hang coincides with `empty DTB`, the DTB
-  gap (finding #3) is the prime suspect, not the kernel itself.
-- `CONFIG_MLXBF_TMFIFO=m` — hvc0 (rshim console) is **not built-in**. Make it
-  `=y` so the rshim console works from early boot and installers are visible.
+- The old "hangs after `HW watchdog disab…`" symptom is **resolved** — with the
+  MMC stack built in, that line is simply the last one before GRUB hands off and
+  the kernel boots to a full multi-user system (verified 2026-07-20).
+- `MLXBF_TMFIFO` and `EFIVAR_FS` are now forced `=y` (2026-07-20) so the rshim
+  console exists from early boot and efivarfs needs no module. Note that `=y`
+  did **not** make efivarfs usable in the BFB boot path — see the EFI-runtime
+  finding below; the driver was never the constraint.
 
 ## NVIDIA install mechanism (reference, from `bfb-install` on the stock bundle)
 
@@ -111,6 +116,92 @@ INFO[MISC]: Ubuntu installation completed
 
 Same "write an OS image to eMMC then reboot" model as our dd installer.
 `bfb-install --bfb <f> [--config bf.cfg] [--rootfs rootfs.tar.xz] --rshim rshim0`.
+
+## 2026-07-20 session — install and boot work; three new blockers
+
+### What is proven working
+
+- **Install**: BFB push → eMMC flash → reboot, three times over.
+- **Boot**: the installed DozenOS boots to `Reached target DozenOS target` and
+  `Configuration success` — root mounted off `mmcblk0`, the whole systemd stack
+  up. The MMC fix is confirmed end-to-end.
+- **Auto-boot**: with a UEFI boot entry present, UEFI goes straight to GRUB and
+  into DozenOS with no operator action.
+- **NVRAM writes work** — an entry added by hand from the EFI shell
+  (`bcfg boot add 0 FS0:\EFI\BOOT\BOOTAA64.EFI "DozenOS"`) survived reboots and
+  even a reinstall. So nothing about this board rejects boot entries; only the
+  installer cannot create them (next finding).
+
+### Blocker 1 — no EFI runtime in the BFB/rshim boot path
+
+`mount -t efivarfs` in the installer fails with **`No such device` (ENODEV)**
+even though `CONFIG_EFIVAR_FS=y` is verified present in the built kernel (the
+CI kernel-config gate checks all 24 options). `efivarfs_init()` registers its
+filesystem type **only when the firmware handed over working EFI runtime
+services**; ENODEV therefore means EFI runtime is absent in that boot, not that
+the driver is missing.
+
+Consequence: **`efibootmgr` can never work from the installer as currently
+booted** — it is not an installer bug and no amount of fixing the efibootmgr
+call will help. Either the BFB boot path must be made to deliver EFI runtime,
+or the boot entry must be registered from the installed system (which boots via
+GRUB and does have full EFI). Diagnostics that dump `/sys/firmware/efi`,
+`/proc/filesystems` and the EFI dmesg lines are now in the installer but have
+not yet produced output (see blocker 2 — the installer stopped being reachable).
+
+Ruled out: 64K-page runtime-region misalignment (the kernel is `ARM64_4K_PAGES`),
+missing driver (`=y`), and `CONFIG_EFI` (=y).
+
+### Blocker 2 — a valid NVRAM boot entry blocks BFB re-flashing
+
+Once `Boot0022 DozenOS` existed and pointed at a working bootloader, **pushing a
+BFB no longer installed anything**: UEFI followed BootOrder, booted DozenOS off
+the eMMC, and the installer never ran (`BlueField-2 installer` banner absent
+from the console log).
+
+Why the first installs worked: BootOrder held only a stale `ubuntu0` (dangling
+partition GUID) and a set of network entries, all of which fail. UEFI fell
+through them and eventually reached the BFB's own "Linux from rshim" entry. A
+*successful* entry earlier in BootOrder stops that fall-through — so DozenOS
+bricks its own re-install path the moment it installs cleanly.
+
+Things that do **not** solve it:
+
+- **`BOOT_MODE 0` (rshim)** — this only selects where **ATF/UEFI** are loaded
+  from. UEFI still consults NVRAM BootOrder afterwards and still picks the eMMC
+  OS. It also does not persist: it reads back as `1` after the next boot.
+- **`bfb-install`** — it has no boot-mode or boot-order override at all; it
+  `cat`s the BFB to `/dev/rshim0/boot` and then polls `/dev/rshim0/misc`.
+- **Redfish/BMC boot options** — deliberately out of scope: stock BFBs do not
+  depend on a DPU BMC, so neither can we.
+
+Our BFB's structure matches NVIDIA's (`mlx-mkbfb -d`): boot-desc v0, boot-path
+v0, boot-args v0+v2, kernel v0, initramfs v0 — no missing image explains it, so
+the open question is how the firmware *orders* the rshim entry, not whether it
+exists.
+
+### Blocker 3 — no usable login on the installed system
+
+| Path | Behaviour |
+|------|-----------|
+| rshim console (hvc0) | alive the whole boot, but **no getty** — DozenOS puts its getty on ttyAMA0 |
+| BMC SoL / ttyAMA0 (port 2200) | carries firmware, GRUB and early kernel output, then **goes silent in early userspace**; raw reads of both BMC UARTs return 0 bytes afterwards |
+| GRUB | renders on ttyAMA0 but **ignores serial input** (no `terminal_input serial`), so the menu cannot be interrupted to edit the cmdline |
+| UEFI setup menu | reachable by spamming ESC during UEFI, but **password-protected**; `bluefield` is rejected |
+
+Net effect: the system boots and runs correctly yet cannot be logged into, and
+because of blocker 2 it also cannot be re-flashed. Recommended fix regardless of
+the rest: **give the DPU image a getty on hvc0 as well as ttyAMA0**, so the rshim
+console is always a way in.
+
+### Installer speed
+
+The installer now flashes with `qemu-img convert -n -p -f qcow2 -O raw` straight
+onto `/dev/mmcblk0` instead of `zcat | dd` of a full-size raw image: only
+allocated clusters are written and zero regions become BLKZEROOUT requests, so
+an install writes roughly 1 GB rather than the full 16 GB. `qemu-img` is bundled
+into the initramfs with its shared libraries (visible as 22 bundled libs, versus
+4 for the old efibootmgr+pv set).
 
 ## Installer-kernel strategy
 
