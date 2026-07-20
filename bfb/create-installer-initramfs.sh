@@ -109,7 +109,10 @@ echo "I: bundled efibootmgr + pv with $(find "$root/lib" "$root/usr/lib" -name '
 # MMC_DW_BLUEFIELD is =y in the DozenOS kernel so this is normally unused, but
 # if a modules dir is given, stage the dw_mmc host stack for a modular kernel.
 if [ -n "$MODDIR" ] && [ -d "$MODDIR" ]; then
-  for name in dw_mmc dw_mmc-pltfm dw_mmc-bluefield mmc_core mmc_block; do
+  # efivarfs + vfat (+ nls deps): the DozenOS kernel builds these =m, and the
+  # installer needs them for efibootmgr (efivars) and the on-ESP install log.
+  for name in dw_mmc dw_mmc-pltfm dw_mmc-bluefield mmc_core mmc_block \
+              efivarfs fat vfat nls_cp437 nls_iso8859-1 nls_ascii; do
     while IFS= read -r ko; do
       [ -n "$ko" ] || continue; base=$(basename "$ko")
       case "$base" in
@@ -194,6 +197,17 @@ sync
 if ! grep -q efivarfs /proc/mounts; then
   say "W: efivarfs not mounted; retrying"
   say "$(mount -t efivarfs efivarfs /sys/firmware/efi/efivars 2>&1)"
+fi
+# efivarfs registers its filesystem type only when the firmware handed the
+# kernel working EFI runtime services; a bare ENODEV on mount means they are
+# absent, not that the driver is missing. Dump what the kernel actually saw so
+# the failure is diagnosable from one install run.
+if ! grep -q efivarfs /proc/mounts; then
+  say "D: /proc/filesystems efi: $(grep -c efi /proc/filesystems)"
+  say "D: /sys/firmware/efi: $(ls /sys/firmware/efi 2>&1 | tr '\n' ' ')"
+  say "D: cmdline: $(cat /proc/cmdline)"
+  say "D: dmesg efi:"
+  say "$(dmesg | grep -iE 'efi|uefi' | head -20)"
 fi
 if command -v efibootmgr >/dev/null 2>&1 && grep -q efivarfs /proc/mounts; then
   say "I: registering UEFI boot entry for DozenOS..."
