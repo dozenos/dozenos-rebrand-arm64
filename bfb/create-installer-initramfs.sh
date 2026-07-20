@@ -143,10 +143,18 @@ mount -t devtmpfs dev      /dev 2>/dev/null || mdev -s
 mount -t efivarfs efivarfs /sys/firmware/efi/efivars 2>/dev/null || true
 export PATH=/usr/bin:/bin:/sbin
 export LD_LIBRARY_PATH=/lib:/usr/lib:/lib/aarch64-linux-gnu:/usr/lib/aarch64-linux-gnu
-# /dev/console follows the last console= (make sure the DPU BFB boot-args put a
-# real console last); progress below goes there.
-echo
-echo "=== DozenOS BlueField-2 installer ==="
+# /dev/console follows the last console= in the BFB boot-args (ttyAMA0, which
+# may be unattached) -- broadcast every message to all consoles instead, and
+# accumulate a copy for the on-ESP install log.
+LOG=/install.log
+say() {
+  echo "$@" >> $LOG
+  for c in /dev/console /dev/hvc0 /dev/ttyAMA0 /dev/ttyAMA1; do
+    echo "$@" > $c 2>/dev/null
+  done
+}
+say ""
+say "=== DozenOS BlueField-2 installer ==="
 
 # eMMC host driver is built in (dw_mmc-bluefield); load any fallback modules
 # then wait for /dev/mmcblk0.
@@ -161,18 +169,18 @@ done
 TGT=/dev/mmcblk0
 for i in $(seq 1 30); do [ -b "$TGT" ] && break; sleep 1; mdev -s 2>/dev/null || true; done
 if [ ! -b "$TGT" ]; then
-  echo "E: eMMC $TGT not found. dmesg:"; dmesg | grep -iE 'mmc|dwmmc|PRP0001' | tail -20
-  echo "E: dropping to a shell."; exec /bin/busybox sh
+  say "E: eMMC $TGT not found. dmesg:"; say "$(dmesg | grep -iE 'mmc|dwmmc|PRP0001' | tail -20)"
+  say "E: dropping to a shell."; exec /bin/busybox sh
 fi
 
-echo "I: flashing DozenOS onto $TGT (this wipes it)..."
+say "I: flashing DozenOS onto $TGT (this wipes it)..."
 SIZE=$(gzip -l /disk.img.gz 2>/dev/null | awk 'NR==2{print $2}')
 if command -v pv >/dev/null 2>&1 && [ -n "$SIZE" ]; then
   zcat /disk.img.gz | pv -s "$SIZE" | dd of="$TGT" bs=4M conv=fsync 2>/dev/null
 else
   zcat /disk.img.gz | dd of="$TGT" bs=4M conv=fsync 2>&1
-fi || { echo "E: dd failed -- shell."; exec /bin/busybox sh; }
-echo "I: ===== FLASH COMPLETE ====="
+fi || { say "E: dd failed -- shell."; exec /bin/busybox sh; }
+say "I: ===== FLASH COMPLETE ====="
 # fix the backup GPT to the real (larger) eMMC end -- best effort
 command -v sgdisk >/dev/null 2>&1 && sgdisk -e "$TGT" 2>/dev/null || true
 sync
@@ -180,16 +188,35 @@ sync
 # Register a UEFI boot entry for the DozenOS ESP so the DPU boots it without a
 # manual EFI-shell step. The DozenOS image ESP is partition 2 with the
 # removable-media bootloader at \EFI\BOOT\BOOTAA64.EFI (confirmed on hardware).
-if command -v efibootmgr >/dev/null 2>&1 && [ -d /sys/firmware/efi/efivars ]; then
-  echo "I: registering UEFI boot entry for DozenOS..."
-  efibootmgr -c -d "$TGT" -p 2 -L DozenOS -l '\EFI\BOOT\BOOTAA64.EFI' 2>&1 | tail -2 || \
-    echo "W: efibootmgr failed; boot via UEFI menu / EFI shell (\\EFI\\BOOT\\BOOTAA64.EFI)"
+# A mounted efivarfs is a hard prerequisite: the mountpoint directory exists in
+# sysfs whenever EFI runtime services are up, so test /proc/mounts, not -d.
+if ! grep -q efivarfs /proc/mounts; then
+  say "W: efivarfs not mounted; retrying"
+  say "$(mount -t efivarfs efivarfs /sys/firmware/efi/efivars 2>&1)"
+fi
+if command -v efibootmgr >/dev/null 2>&1 && grep -q efivarfs /proc/mounts; then
+  say "I: registering UEFI boot entry for DozenOS..."
+  say "$(efibootmgr -c -d "$TGT" -p 2 -L DozenOS -l '\EFI\BOOT\BOOTAA64.EFI' 2>&1 | tail -3)"
+  say "I: boot entries now:"
+  say "$(efibootmgr 2>&1 | head -8)"
 else
-  echo "W: no efibootmgr/efivars; set the boot entry manually if UEFI drops to PXE"
+  say "E: efibootmgr unusable (efivarfs: $(grep -c efivarfs /proc/mounts)); boot via EFI shell \\EFI\\BOOT\\BOOTAA64.EFI"
+fi
+
+# Drop the install log onto the freshly-written ESP so it is readable from the
+# installed system / EFI shell even when no console was attached.
+mdev -s 2>/dev/null || true
+if mount -t vfat "${TGT}p2" /mnt 2>/dev/null; then
+  dmesg | tail -40 >> $LOG 2>/dev/null || true
+  cp $LOG /mnt/dozenos-install.log 2>/dev/null || true
+  umount /mnt
+  say "I: install log written to ESP:/dozenos-install.log"
+else
+  say "W: could not mount ${TGT}p2; install log not persisted"
 fi
 
 sync
-echo "I: done. Rebooting into installed DozenOS in 5s."
+say "I: done. Rebooting into installed DozenOS in 5s."
 sleep 5
 reboot -f
 INIT
