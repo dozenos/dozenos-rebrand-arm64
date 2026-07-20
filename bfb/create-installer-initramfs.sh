@@ -241,7 +241,12 @@ grow_root() {
   if [ "$fsck_rc" -gt 1 ]; then
     say "W: e2fsck rc=$fsck_rc: $(echo "$fsck_out" | tail -2)"
   fi
-  out=$(resize2fs "${TGT}p3" 2>&1) \
+  # -f is required here, and it is not skipping the safety check. resize2fs
+  # refuses when s_lastcheck < s_mtime, and the DPU has no usable clock during
+  # install -- it dates files to 1980, so the check e2fsck just recorded looks
+  # older than the image's own mtime no matter how many times it runs. We ran
+  # e2fsck immediately above and inspected its result, so force the resize.
+  out=$(resize2fs -f "${TGT}p3" 2>&1) \
     || { say "W: resize2fs failed ($out); e2fsck said: $(echo "$fsck_out" | tail -2)"; return 1; }
   say "I: root grown -- $(echo "$out" | tail -1)"
 }
