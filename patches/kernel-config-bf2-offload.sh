@@ -153,12 +153,6 @@ enable_opt "$DEFCONFIG" MMC_SDHCI_OF_DWCMSHC m
 add_opt "$DEFCONFIG" MLXBF_TMFIFO m
 add_opt "$DEFCONFIG" MLXBF_BOOTCTL m
 add_opt "$DEFCONFIG" MLXBF_PMC m
-# mlxbf-ptm (power/thermal monitor) + IPMB device iface (DPU<->BMC): both ship
-# as NVIDIA SoC driver src (doca SOURCES/SoC) and are upstream in 6.18. Not
-# boot-critical, but complete the BF2 driver set; PTM is relevant to the
-# thermal behaviour seen during bring-up.
-add_opt "$DEFCONFIG" MLXBF_PTM m
-add_opt "$DEFCONFIG" IPMB_DEVICE_INTERFACE m
 add_opt "$DEFCONFIG" GPIO_MLXBF2 m
 add_opt "$DEFCONFIG" GPIO_MLXBF3 m
 add_opt "$DEFCONFIG" PINCTRL_MLXBF3 m
