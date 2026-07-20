@@ -46,7 +46,7 @@ set -euo pipefail
 die() { printf 'create-installer-initramfs: %s\n' "$*" >&2; exit 2; }
 need() { command -v "$1" >/dev/null 2>&1 || die "missing tool: $1"; }
 
-DISK="" BUSYBOX="" OUT="" MODDIR="" KVER="" CFGDEFAULT=""
+DISK="" BUSYBOX="" OUT="" MODDIR="" KVER=""
 while [ $# -gt 0 ]; do
   case "$1" in
     --disk)        DISK="${2:?}"; shift 2 ;;
@@ -54,7 +54,6 @@ while [ $# -gt 0 ]; do
     --out)         OUT="${2:?}"; shift 2 ;;
     --modules-dir) MODDIR="${2:?}"; shift 2 ;;
     --kver)        KVER="${2:?}"; shift 2 ;;
-    --config-boot-default) CFGDEFAULT="${2:?}"; shift 2 ;;
     -h|--help)     sed -n '2,40p' "${BASH_SOURCE[0]}" | sed 's/^# \{0,1\}//'; exit 0 ;;
     *)             die "unknown argument: $1" ;;
   esac
@@ -72,8 +71,8 @@ mkdir -p "$root"/{bin,sbin,proc,sys,dev,mnt,lib,usr/bin,lib/modules}
 
 cp "$BUSYBOX" "$root/bin/busybox"; chmod +x "$root/bin/busybox"
 
-# --- dynamic tools: efibootmgr (UEFI boot entry) + pv (dd progress) ----------
-# The arm64 CI runner already has glibc; efibootmgr/pv + libefivar come from
+# --- dynamic tools: efibootmgr (UEFI boot entry) + qemu-img (flashing) -------
+# The arm64 CI runner already has glibc; efibootmgr + libefivar come from
 # apt. Copy every NEEDED shared object + the dynamic loader so the tools run in
 # the bare initramfs.
 LIBDIR=/lib/aarch64-linux-gnu
@@ -140,30 +139,6 @@ fi
 # only allocated clusters are written and zero regions become BLKZEROOUT
 # requests, so a mostly-empty 16 GB image no longer costs 16 GB of eMMC
 # writes (and minutes of dd time) per install.
-# --- config.boot with a serial console, generated here -----------------------
-# Built on the runner rather than on the DPU: the installed root is ext4 and
-# its OS lives in a squashfs, and squashfs/loop are modules the installer
-# initramfs would otherwise have to carry just to read one file. Generating it
-# here leaves the installer needing only ext4 to drop the finished file in.
-if [ -n "$CFGDEFAULT" ] && [ -f "$CFGDEFAULT" ]; then
-  awk '
-    /^system \{$/ && !done {
-      print
-      print "    console {"
-      print "        device ttyAMA0 {"
-      print "            speed \"115200\""
-      print "        }"
-      print "    }"
-      done = 1
-      next
-    }
-    { print }
-  ' "$CFGDEFAULT" > "$root/config.boot"
-  grep -q 'device ttyAMA0' "$root/config.boot" \
-    || die "config.boot console injection produced no console stanza -- upstream format drift?"
-  echo "I: generated config.boot with console device ttyAMA0"
-fi
-
 if qemu-img info "$DISK" 2>/dev/null | grep -qi 'file format: qcow2'; then
   cp "$DISK" "$root/disk.qcow2"
 else
@@ -199,7 +174,10 @@ say "=== DozenOS BlueField-2 installer ==="
 # driver is =y in the DozenOS kernel; the rest (ext4 for the root partition,
 # vfat for the ESP, efivarfs for efibootmgr) are =m and each drag in several
 # others -- jbd2/mbcache/crc16 for ext4, the nls charsets for vfat.
-for m in dw_mmc-bluefield mmc_block ext4 vfat efivarfs; do
+# nls_* are needed explicitly: the kernel autoloads a vfat charset through
+# /sbin/modprobe, which does not exist in this initramfs, so mounting the ESP
+# fails with EINVAL unless the charsets are already resident.
+for m in dw_mmc-bluefield mmc_block ext4 vfat nls_cp437 nls_iso8859-1 nls_ascii efivarfs; do
   modprobe "$m" 2>/dev/null || say "W: modprobe $m failed"
 done
 TGT=/dev/mmcblk0
@@ -278,45 +256,6 @@ else
   say "$(dmesg | grep -iE 'efi|uefi' | head -20)"
 fi
 [ "$efivars_mount" = 1 ] && umount /sys/firmware/efi/efivars 2>/dev/null
-
-# Seed the installed system's config.boot with a serial console.
-#
-# INTERIM -- this belongs in config.boot proper (i.e. shipped in the image's
-# config.boot.default) rather than being injected by the installer. It lives
-# here for now because that file comes from the dozenos-1x package and putting
-# a DPU console into it would change every arm64 flavor, not just the DPU.
-#
-# Why it is needed at all: DozenOS derives its serial getty from `system
-# console device` in config.boot, NOT from the kernel cmdline. systemd's
-# getty-generator does start serial-getty@ttyAMA0 from console=ttyAMA0, but
-# once the config is applied (dozenos-router, ~80 s in) the config takes over
-# console management and no login prompt is ever printed -- observed on
-# hardware: full boot to "Configuration success", UART carrying output the
-# whole time, and no `login:` anywhere.
-#
-# config.boot is the WHOLE configuration when present, so seed it from the
-# image's own config.boot.default with the console block inserted, rather than
-# writing a fragment.
-seed_console_config() {
-  [ -f /config.boot ] || { say "W: console seed: no /config.boot in the initramfs"; return 1; }
-  mkdir -p /mnt/root
-  mnt_err=$(mount -t ext4 "${TGT}p3" /mnt/root 2>&1)
-  if ! mount | grep -q "${TGT}p3"; then
-    say "W: console seed: cannot mount ${TGT}p3 ($mnt_err)"
-    return 1
-  fi
-  ver_dir=$(ls -d /mnt/root/boot/*/ 2>/dev/null | head -1)
-  if [ -z "$ver_dir" ]; then
-    say "W: console seed: no boot/<version>/ on ${TGT}p3"
-    umount /mnt/root; return 1
-  fi
-  dst="${ver_dir}rw/opt/vyatta/etc/config/config.boot"
-  mkdir -p "$(dirname "$dst")"
-  cp /config.boot "$dst" && chmod 0660 "$dst" 2>/dev/null
-  say "I: seeded config.boot (console ttyAMA0) at ${dst#/mnt/root}"
-  umount /mnt/root 2>/dev/null
-}
-seed_console_config || say "W: config.boot console seeding failed; login may be unavailable on ttyAMA0"
 
 # Drop the install log onto the freshly-written ESP so it is readable from the
 # installed system / EFI shell even when no console was attached.
