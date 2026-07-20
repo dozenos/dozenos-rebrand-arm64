@@ -56,10 +56,9 @@ Consequences:
    (`--image` / `--boot-args`) suppresses the DTB. `bootimages` note: our old
    base is 4.11.0 and **downgrades** a board the DOCA bundle put at 4.15.0 —
    should pin a newer base regardless.
-4. **`zstdcat` in our installer `/init` but busybox has no zstd.** The arm64
-   busybox has gzip/gunzip/zcat only. Our `create-installer-initramfs.sh` was
-   never hardware-validated. Fix: ship the disk image gzip-compressed and
-   `zcat | dd`, or bundle a static `zstd`.
+4. **`zstdcat` in our installer `/init` but busybox has no zstd.** Long since
+   moot: the installer no longer decompresses anything itself — the image ships
+   as qcow2 and a bundled `qemu-img` writes it out.
 
 ## eMMC on BF2 — the real blocker (root-caused on hardware)
 
@@ -73,15 +72,10 @@ Consequences:
 - **`EFI stub: Generating empty DTB` is normal**, not a fault. The stock NVIDIA
   installer shows it too and still erases/writes `/dev/mmcblk0` — the DPU boots
   via **ACPI**, eMMC included. So DTB/ATF is a dead end; don't chase it.
-- **Installer initramfs must bring up the eMMC like udev does.** A busybox
-  `insmod` of a fixed module list is fragile: the eMMC needs the *right* driver
-  loaded (`dw_mmc-bluefield`) and its ACPI/clock deps. Two working shapes:
-  (a) reuse the NVIDIA casper initrd (real `udevadm trigger` coldplug), or
-  (b) `modprobe dw_mmc-bluefield` **directly** now that the driver is known.
-  A blind "modprobe every `/sys` modalias" coldplug DID bring the eMMC up, but
-  then hung the init on some later device's module — so target the driver.
-- Disk image must be **gzip** (`zcat|dd`) not zstd — the busybox in our
-  installer initramfs has gzip/zcat but no zstd.
+- **Installer initramfs must bring up the eMMC like udev does.** Settled: the
+  initramfs carries the whole module tree with depmod metadata and names what
+  it needs via `modprobe`. See the module-loading finding below for why a
+  curated `insmod` list cannot work.
 
 ## DozenOS kernel MMC config (fixed 2026-07-19)
 
@@ -166,191 +160,116 @@ implementation exists, diff against it early.
 
 ### What the installer now does (mirroring NVIDIA)
 
-1. flash with `qemu-img convert -n -p -f qcow2 -O raw` onto `/dev/mmcblk0`;
-2. `blockdev --rereadpt` — the kernel still holds the *previous* OS's partition
+1. `modprobe` the filesystems it needs (all `=m`) from the bundled tree;
+2. flash with `qemu-img convert -n -p -f qcow2 -O raw` onto `/dev/mmcblk0`;
+3. `sgdisk -e`, `parted resizepart 3 100%`, `e2fsck -f -y`, `resize2fs -f` —
+   grow into whatever the card actually holds;
+4. `blockdev --rereadpt` — the kernel still holds the *previous* OS's partition
    table, so `p2` would otherwise resolve to the old ESP offset;
-3. `mount -t efivarfs none /sys/firmware/efi/efivars` **at the point of use**;
-4. delete any existing entry with our label, `efibootmgr -c -d /dev/mmcblk0
+5. `mount -t efivarfs none /sys/firmware/efi/efivars` **at the point of use**;
+6. delete any existing entry with our label, `efibootmgr -c -d /dev/mmcblk0
    -p 2 -L DozenOS -l '\EFI\BOOT\BOOTAA64.EFI'`, verify, retry, and fall back to
    `bfbootmgr --cleanall` before giving up;
-5. unmount efivarfs and reboot.
+7. write the install log to the ESP, unmount efivarfs, reboot.
 
-### Serial login needs BOTH the cmdline and config.boot
+### Serial login comes from the flavor, not from config.boot
 
-`console=` alone does **not** give DozenOS a login prompt. Observed on hardware
-with `console=ttyAMA0`: systemd's getty-generator does start
-`serial-getty@ttyAMA0`, the UART carries output all the way to
-`Configuration success` (so the earlier "the UART dies in early userspace"
-reading was wrong — it simply had nothing left to print), and yet no `login:`
-is ever emitted. Cause: DozenOS takes its serial console from `system console
-device` in **config.boot**, and the image's `config.boot.default` has no
-`console` section at all — `getty.target.wants/` ships only `getty@tty1`. Once
-`dozenos-router` applies the config (~80 s in) the config owns console
-management and the generator-spawned getty produces nothing.
+`console=` alone does not obviously give a login prompt, and the path to
+understanding why cost two wrong turns worth recording.
 
-So the flavor sets `console_type = "ttyAMA"` (GRUB cmdline) **and** the
-installer seeds config.boot:
+What is true: DozenOS takes its serial console from `system console device` in
+**config.boot**, and the image's `config.boot.default` ships no `console`
+section at all (`getty.target.wants/` holds only `getty@tty1`). What is *also*
+true, and is the part that matters: **VyOS derives that setting from the kernel
+cmdline itself** — the running config came back carrying
+`device ttyAMA0 { kernel; speed "115200" }`, the `kernel` flag marking it as
+auto-derived.
 
-```
-system {
-    console {
-        device ttyAMA0 {
-            speed "115200"
-        }
-    }
-}
+So the fix is one line in the flavor:
+
+```toml
+[boot_settings]
+console_type = "ttyAMA"
 ```
 
-config.boot is the *entire* configuration when present, so the installer builds
-it from the image's own `config.boot.default` (read out of the squashfs on the
-freshly flashed disk) with the console block inserted, and writes it to
-`boot/<version>/rw/opt/vyatta/etc/config/config.boot` — the union-mount
-writable layer named by `persistence.conf` (`/ union`).
+GRUB then emits `console=ttyAMA0,115200`, VyOS picks it up, and the login
+prompt appears. **dozenos-build is untouched and nothing is injected into the
+installed system.**
 
-**INTERIM — this should move into `config.boot.default` proper.** It sits in
-the installer only because that file ships in the *dozenos-1x package*, so
-overriding it would change every arm64 flavor rather than only the DPU. The
-sanctioned place to do that when the time comes is a
-`dozenos-rebrand-arm64/patches/` script writing
-`includes.chroot/usr/share/dozenos/config.boot.default` — that layer patches a
-CI checkout and is never pushed back, so dozenos-build's integrity is
-preserved either way.
+The wrong turns, since both looked well-evidenced at the time:
 
-NVIDIA solves the same problem differently, via
-`chroot /mnt systemctl enable serial-getty@{ttyAMA0,ttyAMA1,hvc0}` — which does
-not transfer, since a DozenOS root is a read-only squashfs.
+1. *"The UART dies in early userspace."* It does not. Output flows to
+   `Configuration success` at ~82 s and beyond; there was simply nothing
+   further to print, and no getty to answer a keypress. Raw reads of the BMC
+   UARTs returning 0 bytes looked like a dead link and was not.
+2. *"The installer must seed config.boot."* Built and shipped it — generate the
+   file on the runner from the image's own `config.boot.default`, drop it into
+   `boot/<version>/rw/opt/vyatta/etc/config/config.boot`. It worked, and it was
+   redundant: with the flavor fixed, VyOS wrote its own stanza too and
+   config.boot came back with **two** `console` blocks. Removed again.
 
-## 2026-07-20 session — earlier state (superseded by the section above)
+The earlier attempts failed only because the image still said `console_type =
+"hvc"` — VyOS was faithfully configuring hvc0, which is not where anyone was
+looking.
 
-### What is proven working
+### Module loading: the whole tree, and modprobe
 
-- **Install**: BFB push → eMMC flash → reboot, three times over.
-- **Boot**: the installed DozenOS boots to `Reached target DozenOS target` and
-  `Configuration success` — root mounted off `mmcblk0`, the whole systemd stack
-  up. The MMC fix is confirmed end-to-end.
-- **Auto-boot**: with a UEFI boot entry present, UEFI goes straight to GRUB and
-  into DozenOS with no operator action.
-- **NVRAM writes work** — an entry added by hand from the EFI shell
-  (`bcfg boot add 0 FS0:\EFI\BOOT\BOOTAA64.EFI "DozenOS"`) survived reboots and
-  even a reinstall. So nothing about this board rejects boot entries; only the
-  installer cannot create them (next finding).
+`insmod` resolves no dependencies. A curated list loaded in alphabetical order
+put `ext4` before `jbd2` and died with `Unknown symbol jbd2_journal_wipe`,
+which took the root-partition mount with it. A multi-pass retry loop hid the
+ordering rather than fixing it, and every new module meant guessing its
+dependency chain again.
 
-### Blocker 1 — no EFI runtime in the BFB/rshim boot path
+The initramfs now stages the **entire** module tree (1479 modules, 148 MB)
+plus depmod metadata and names what it wants via `modprobe`. Modules are
+decompressed on the way in — the kernel sets `CONFIG_MODULE_COMPRESS_XZ` and
+busybox's modprobe has no `.ko.xz` support (its binary carries no such string),
+so a plain `.ko` tree removes the question. Cost measured: 34 MB compressed vs
+~210 MB decompressed, ~35 MB net in the gzip'd cpio.
 
-`mount -t efivarfs` in the installer fails with **`No such device` (ENODEV)**
-even though `CONFIG_EFIVAR_FS=y` is verified present in the built kernel (the
-CI kernel-config gate checks all 24 options). `efivarfs_init()` registers its
-filesystem type **only when the firmware handed over working EFI runtime
-services**; ENODEV therefore means EFI runtime is absent in that boot, not that
-the driver is missing.
+Relevant because **EXT4, VFAT, SQUASHFS and BLK_DEV_LOOP are all `=m`** in the
+DozenOS kernel — anything the installer wants to mount needs its module.
 
-Consequence: **`efibootmgr` can never work from the installer as currently
-booted** — it is not an installer bug and no amount of fixing the efibootmgr
-call will help. Either the BFB boot path must be made to deliver EFI runtime,
-or the boot entry must be registered from the installed system (which boots via
-GRUB and does have full EFI). Diagnostics that dump `/sys/firmware/efi`,
-`/proc/filesystems` and the EFI dmesg lines are now in the installer but have
-not yet produced output (see blocker 2 — the installer stopped being reachable).
+NLS charsets need naming explicitly (`nls_cp437`, `nls_iso8859-1`,
+`nls_ascii`): the kernel autoloads a vfat charset by calling `/sbin/modprobe`,
+which does not exist in this initramfs, so mounting the ESP fails with
+**EINVAL** — not the ENODEV you would expect from a missing filesystem driver.
 
-Ruled out: 64K-page runtime-region misalignment (the kernel is `ARM64_4K_PAGES`),
-missing driver (`=y`), and `CONFIG_EFI` (=y).
+### Growing the root filesystem, and the 1980 clock
 
-### Blocker 2 — our BFB loses to the eMMC OS; the stock BFB does not
+The image is built for the smallest supported eMMC, so on a 38.9 GiB card 23
+GiB sat unused and every boot logged `GPT: 33554431 != 81494015`.
 
-**RETRACTED — no cause established (2026-07-20).** Two independent checks
-knocked the NVRAM theory down, and the packaging theory that replaced it did
-not survive either.
-
-1. A stock NVIDIA Ubuntu BFB pushed with `bfb-install` on this board, with
-   `Boot0022 DozenOS` present and bootable, **did** reach its rshim installer.
-2. Our own timeline says the same thing: `Boot0022` was created at 06:38 and
-   the **v2 install at 06:49 ran fine**. Only the later v3 pushes did not.
-
-So a valid NVRAM boot entry does not block BFB flashing.
-
-A byte-level `mlx-mkbfb -x` comparison then cleared our packaging too — every
-field that governs the rshim boot entry is **identical to the stock BFB**:
-
-| image | stock | ours |
-|-------|-------|------|
-| `boot-desc-v0` | `Linux from rshim` | same |
-| `boot-path-v0` | `VenHw(F019E406-8C9C-11E5-8797-001ACA00BFC4)/Image` | same |
-| `boot-args-v0` | `console=ttyAMA1 console=hvc0 console=ttyAMA0 earlycon=pl011,0x01000000 earlycon=pl011,0x01800000 initrd=initramfs` | same |
-| `boot-args-v2` | `console=hvc0 console=ttyAMA0 earlycon=pl011,0x13010000 initrd=initramfs` | same |
-| `boot-acpi-v0` | `default` | same |
-
-Only two real differences remain, neither of which governs boot selection:
-stock carries an extra `info-v0` (a Redfish *Software Inventory* JSON listing
-BSP/ATF versions — reporting metadata for the BMC), and stock stores its kernel
-LZMA-compressed (12.8 MB) where ours is a raw Image (35.3 MB) — and our raw
-Image has demonstrably booted.
-
-v2 (worked) and v3 (did not) are themselves structurally identical: same
-kernel bytes, same boot metadata, initramfs 529.0 MB vs 534.0 MB.
-
-**Therefore the v3 "installer never ran" observation is unexplained, and the
-conditions it was taken under were poor**: a leftover v2 `bfb-install` process
-was still running, the rshim console bridge was torn down and rebuilt several
-times around the push, and the board was `SW_RESET` more than once mid-flight.
-The missing `BlueField-2 installer` banner may well be lost console output
-rather than a boot that never happened. **Next step: one controlled push — a
-single `bfb-install`, one long-lived console reader started before the push,
-no resets — before theorising further.**
-
-Things that do **not** solve it:
-
-- **`BOOT_MODE 0` (rshim)** — this only selects where **ATF/UEFI** are loaded
-  from. UEFI still consults NVRAM BootOrder afterwards and still picks the eMMC
-  OS. It also does not persist: it reads back as `1` after the next boot.
-- **`bfb-install`** — it has no boot-mode or boot-order override at all; it
-  `cat`s the BFB to `/dev/rshim0/boot` and then polls `/dev/rshim0/misc`.
-- **Redfish/BMC boot options** — deliberately out of scope: stock BFBs do not
-  depend on a DPU BMC, so neither can we.
-
-Our BFB's structure matches NVIDIA's (`mlx-mkbfb -d`): boot-desc v0, boot-path
-v0, boot-args v0+v2, kernel v0, initramfs v0 — no missing image explains it, so
-the open question is how the firmware *orders* the rshim entry, not whether it
-exists.
-
-### Blocker 3 — no usable login on the installed system (rig-specific)
-
-| Path | Behaviour |
-|------|-----------|
-| rshim console (hvc0) | alive the whole boot, but **no getty** — DozenOS puts its getty on ttyAMA0 |
-| BMC SoL / ttyAMA0 (port 2200) | carries firmware, GRUB and early kernel output, then **goes silent in early userspace**; raw reads of both BMC UARTs return 0 bytes afterwards |
-| GRUB | renders on ttyAMA0 but **ignores serial input** (no `terminal_input serial`), so the menu cannot be interrupted to edit the cmdline |
-| UEFI setup menu | reachable by spamming ESC during UEFI, but **password-protected**; `bluefield` is rejected (see below) |
-
-**UEFI password.** The documented default is `bluefield`, but BlueField forces a
-change on first use and the policy requires **12–64 characters**, so a board
-that has ever been entered has a non-guessable password. Official reset, run
-**on the DPU**:
-
-```bash
-sudo bfrec --capsule /usr/lib/firmware/mellanox/boot/capsule/EnrollKeysCap
-sudo reboot
+```
+sgdisk -e /dev/mmcblk0              # backup GPT header to the true end of disk
+parted -s /dev/mmcblk0 resizepart 3 100%
+e2fsck -f -y /dev/mmcblk0p3
+resize2fs -f /dev/mmcblk0p3
 ```
 
-The capsule is processed on the next boot and puts the password back to
-`bluefield` (which UEFI then makes you change again). Keep `EnrollKeysCap` a
-manual rescue step: it also enrols Secure Boot keys, so it must never be baked
-into a product BFB where every install would silently alter the board's
-security state. Our BFB bundles only `boot_update2.cap` (the ATF/UEFI firmware
-update, pinned to 4.15.0 to stop firmware downgrades) — not `EnrollKeysCap`.
+`parted resizepart` is deliberate: it rewrites only partition 3's end sector,
+leaving the start, the partition GUID and every data block untouched.
+Delete-and-recreate (what `growpart` does) is equally non-destructive in
+principle but stakes the data on reproducing the start sector exactly, and
+there is no reason to take that risk when an in-place operation exists.
 
-Net effect: the system boots and runs correctly yet cannot be logged into, and
-because of blocker 2 it also cannot be re-flashed. Recommended fix regardless of
-the rest: **give the DPU image a getty on hvc0 as well as ttyAMA0**, so the rshim
-console is always a way in.
+**`-f` on resize2fs is required, and is not a bypass.** resize2fs refuses when
+`s_lastcheck < s_mtime`, and the DPU has no usable clock during install — it
+stamps files **1980**, which is visible on the ESP install log's timestamp. So
+the check e2fsck just recorded always looks older than the 2026 image, however
+many times e2fsck runs. The symptom is thoroughly misleading: resize2fs says
+"Please run 'e2fsck -f' first" *after* a successful e2fsck that completed all
+five passes. Run e2fsck, inspect its result, then force.
 
-### Installer speed
+Result on hardware: `df` 15 G → **38 G**, `lsblk` p3 38.6 G, GPT warning gone.
 
-The installer now flashes with `qemu-img convert -n -p -f qcow2 -O raw` straight
-onto `/dev/mmcblk0` instead of `zcat | dd` of a full-size raw image: only
-allocated clusters are written and zero regions become BLKZEROOUT requests, so
-an install writes roughly 1 GB rather than the full 16 GB. `qemu-img` is bundled
-into the initramfs with its shared libraries (visible as 22 bundled libs, versus
-4 for the old efibootmgr+pv set).
+### Diagnostics discipline
+
+Two failures in this session were prolonged by discarded output:
+`e2fsck ... >/dev/null 2>&1` hid why resize2fs then refused, and an early
+`mount 2>/dev/null` hid EINVAL-vs-ENODEV on the ESP. Both now capture and
+report. In an installer that runs unattended on a board with no login, an
+error message thrown away is an hour of hardware time.
 
 ## Installer-kernel strategy
 
