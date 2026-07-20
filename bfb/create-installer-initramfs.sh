@@ -146,7 +146,6 @@ mkdir -p /proc /sys /dev
 mount -t proc     proc     /proc
 mount -t sysfs    sysfs    /sys
 mount -t devtmpfs dev      /dev 2>/dev/null || mdev -s
-mount -t efivarfs efivarfs /sys/firmware/efi/efivars 2>/dev/null || true
 export PATH=/usr/bin:/bin:/sbin
 export LD_LIBRARY_PATH=/lib:/usr/lib:/lib/aarch64-linux-gnu:/usr/lib/aarch64-linux-gnu
 # /dev/console follows the last console= in the BFB boot-args (ttyAMA0, which
@@ -194,29 +193,54 @@ sync
 # removable-media bootloader at \EFI\BOOT\BOOTAA64.EFI (confirmed on hardware).
 # A mounted efivarfs is a hard prerequisite: the mountpoint directory exists in
 # sysfs whenever EFI runtime services are up, so test /proc/mounts, not -d.
+# Mirrors NVIDIA's own installer (`ubuntu/install.sh:update_efi_bootmgr` in the
+# stock BFB): mount efivarfs at the point of use, drop any existing entry with
+# our label so repeat installs do not pile up duplicates, create the entry, and
+# verify it landed -- retrying, then falling back to wiping the boot entries,
+# exactly as they do.
+efivars_mount=0
 if ! grep -q efivarfs /proc/mounts; then
-  say "W: efivarfs not mounted; retrying"
-  say "$(mount -t efivarfs efivarfs /sys/firmware/efi/efivars 2>&1)"
+  mount -t efivarfs none /sys/firmware/efi/efivars 2>/dev/null && efivars_mount=1
 fi
-# efivarfs registers its filesystem type only when the firmware handed the
-# kernel working EFI runtime services; a bare ENODEV on mount means they are
-# absent, not that the driver is missing. Dump what the kernel actually saw so
-# the failure is diagnosable from one install run.
-if ! grep -q efivarfs /proc/mounts; then
+
+if command -v efibootmgr >/dev/null 2>&1 && grep -q efivarfs /proc/mounts; then
+  say "I: registering UEFI boot entry for DozenOS..."
+  if efibootmgr | grep -q DozenOS; then
+    efibootmgr -b "$(efibootmgr | grep DozenOS | head -1 | cut -c 5-8)" -B >/dev/null 2>&1
+  fi
+  add_entry() {
+    efibootmgr -c -d "$TGT" -p 2 -L DozenOS -l '\EFI\BOOT\BOOTAA64.EFI' >/dev/null 2>&1
+  }
+  add_entry
+  if ! efibootmgr | grep -q DozenOS; then
+    say "W: boot entry did not stick; retrying"
+    add_entry
+    if ! efibootmgr | grep -q DozenOS; then
+      say "W: still missing; clearing boot entries (bfbootmgr --cleanall) and retrying"
+      command -v bfbootmgr >/dev/null 2>&1 && bfbootmgr --cleanall >/dev/null 2>&1
+      add_entry
+    fi
+  fi
+  if efibootmgr | grep -q DozenOS; then
+    say "I: boot entry registered:"
+  else
+    say "E: failed to register the DozenOS boot entry:"
+  fi
+  say "$(efibootmgr 2>&1 | head -6)"
+else
+  # efivarfs registers its filesystem type only when the firmware handed the
+  # kernel working EFI runtime services, so an ENODEV mount means they are
+  # absent rather than that the driver is missing. NVIDIA's installer mounts it
+  # successfully on this same boot path, so if we land here the difference is
+  # ours -- dump what the kernel actually saw.
+  say "E: efivarfs unavailable; cannot register a boot entry"
   say "D: /proc/filesystems efi: $(grep -c efi /proc/filesystems)"
   say "D: /sys/firmware/efi: $(ls /sys/firmware/efi 2>&1 | tr '\n' ' ')"
   say "D: cmdline: $(cat /proc/cmdline)"
   say "D: dmesg efi:"
   say "$(dmesg | grep -iE 'efi|uefi' | head -20)"
 fi
-if command -v efibootmgr >/dev/null 2>&1 && grep -q efivarfs /proc/mounts; then
-  say "I: registering UEFI boot entry for DozenOS..."
-  say "$(efibootmgr -c -d "$TGT" -p 2 -L DozenOS -l '\EFI\BOOT\BOOTAA64.EFI' 2>&1 | tail -3)"
-  say "I: boot entries now:"
-  say "$(efibootmgr 2>&1 | head -8)"
-else
-  say "E: efibootmgr unusable (efivarfs: $(grep -c efivarfs /proc/mounts)); boot via EFI shell \\EFI\\BOOT\\BOOTAA64.EFI"
-fi
+[ "$efivars_mount" = 1 ] && umount /sys/firmware/efi/efivars 2>/dev/null
 
 # Drop the install log onto the freshly-written ESP so it is readable from the
 # installed system / EFI shell even when no console was attached.
