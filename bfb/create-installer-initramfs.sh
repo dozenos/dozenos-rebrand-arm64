@@ -16,9 +16,9 @@
 #
 # Hardware facts this encodes (all confirmed on a BF2):
 #  - eMMC = Synopsys DesignWare (dw_mmc-bluefield, ACPI PRP0001), NOT sdhci. In
-#    the DozenOS kernel MMC_DW_BLUEFIELD is built in (=y), so /dev/mmcblk0
-#    appears on its own -- no module loading needed. A modules dir may still be
-#    passed as a fallback for a modular kernel.
+#    the DozenOS kernel MMC_DW_BLUEFIELD is built in (=y) so /dev/mmcblk0
+#    appears on its own, but EXT4/VFAT/SQUASHFS/LOOP are all =m -- hence the
+#    full module tree plus modprobe rather than a hand-picked insmod list.
 #  - the disk image ships as qcow2; bundled qemu-img writes it out directly.
 #  - after dd the old UEFI boot entries are stale (changed partition GUIDs), so
 #    UEFI drops to PXE unless we add an entry -> efibootmgr creates one pointing
@@ -29,7 +29,8 @@
 #   /bin/busybox     -- static arm64 busybox
 #   /usr/bin/{efibootmgr,qemu-img} + /lib/*.so* -- dynamic tools + glibc deps
 #   /disk.qcow2      -- the DozenOS disk image (qcow2, compressed)
-#   /lib/modules/... -- optional eMMC host .ko fallback (only if --modules-dir)
+#   /lib/modules/<kver>/ -- the full module tree + depmod metadata, so the
+#                           installer can modprobe by name (only if --modules-dir)
 #
 # Usage:
 #   create-installer-initramfs.sh \
@@ -106,26 +107,32 @@ if [ ! -e "$root/lib/ld-linux-aarch64.so.1" ]; then
 fi
 echo "I: bundled efibootmgr + qemu-img with $(find "$root/lib" "$root/usr/lib" -name '*.so*' 2>/dev/null | wc -l) shared libs"
 
-# --- optional modular-eMMC fallback -----------------------------------------
-# MMC_DW_BLUEFIELD is =y in the DozenOS kernel so this is normally unused, but
-# if a modules dir is given, stage the dw_mmc host stack for a modular kernel.
+# --- kernel modules ----------------------------------------------------------
+# Stage the WHOLE module tree plus depmod metadata, so the installer can
+# `modprobe` anything by name and get its dependencies loaded in the right
+# order. Curating a list and insmod'ing it does not work: insmod resolves
+# nothing, so e.g. ext4 fails with "Unknown symbol jbd2_*" unless jbd2, mbcache
+# and crc16 happen to be loaded first -- which an alphabetical loop gets wrong.
+#
+# Modules are decompressed on the way in: whether busybox's modprobe can read
+# compressed modules depends on how that busybox was built, and a plain .ko
+# tree removes the question.
 if [ -n "$MODDIR" ] && [ -d "$MODDIR" ]; then
-  # efivarfs + vfat (+ nls deps): the DozenOS kernel builds these =m, and the
-  # installer needs them for efibootmgr (efivars) and the on-ESP install log.
-  for name in dw_mmc dw_mmc-pltfm dw_mmc-bluefield mmc_core mmc_block \
-              efivarfs fat vfat nls_cp437 nls_iso8859-1 nls_ascii \
-              crc16 mbcache jbd2 ext4; do
-    while IFS= read -r ko; do
-      [ -n "$ko" ] || continue; base=$(basename "$ko")
-      case "$base" in
-        *.ko.xz)  unxz  -c "$ko" > "$root/lib/modules/${base%.xz}" ;;
-        *.ko.zst) zstd -dq -c "$ko" > "$root/lib/modules/${base%.zst}" 2>/dev/null ;;
-        *.ko.gz)  gzip -dc "$ko" > "$root/lib/modules/${base%.gz}" ;;
-        *.ko)     cp "$ko" "$root/lib/modules/$base" ;;
+  [ -n "$KVER" ] || die "--kver is required together with --modules-dir"
+  need depmod
+  dstmod="$root/lib/modules/$KVER"
+  mkdir -p "$dstmod"
+  ( cd "$MODDIR" && find . -type d -print0 | xargs -0 -I{} mkdir -p "$dstmod/{}" )
+  ( cd "$MODDIR" && find . -type f | while IFS= read -r f; do
+      case "$f" in
+        *.ko.xz)  unxz    -c "$f" > "$dstmod/${f%.xz}"  ;;
+        *.ko.zst) zstd -dq -c "$f" > "$dstmod/${f%.zst}" ;;
+        *.ko.gz)  gzip   -dc "$f" > "$dstmod/${f%.gz}"  ;;
+        *)        cp -a "$f" "$dstmod/$f" ;;
       esac
-    done < <(find "$MODDIR" -type f \( -name "${name}.ko" -o -name "${name}.ko.*" \) 2>/dev/null)
-  done
-  echo "I: staged fallback modules: $(ls "$root/lib/modules" 2>/dev/null | tr '\n' ' ')"
+    done )
+  depmod -b "$root" "$KVER"
+  echo "I: staged $(find "$dstmod" -name '*.ko' | wc -l) kernel modules ($(du -sh "$dstmod" | cut -f1)) + depmod metadata"
 fi
 
 # --- the disk image: ship as qcow2 ------------------------------------------
@@ -187,15 +194,13 @@ say() {
 say ""
 say "=== DozenOS BlueField-2 installer ==="
 
-# eMMC host driver is built in (dw_mmc-bluefield); load any fallback modules
-# then wait for /dev/mmcblk0.
-for pass in 1 2 3; do
-  prog=0
-  for ko in /lib/modules/*.ko; do
-    [ -f "$ko" ] || continue
-    insmod "$ko" 2>/dev/null && { prog=1; mv "$ko" "$ko.done" 2>/dev/null || rm -f "$ko"; }
-  done
-  [ "$prog" = 0 ] && break
+# The full module tree with depmod metadata is in the initramfs, so name what
+# the installer needs and let modprobe pull in the dependencies. The eMMC host
+# driver is =y in the DozenOS kernel; the rest (ext4 for the root partition,
+# vfat for the ESP, efivarfs for efibootmgr) are =m and each drag in several
+# others -- jbd2/mbcache/crc16 for ext4, the nls charsets for vfat.
+for m in dw_mmc-bluefield mmc_block ext4 vfat efivarfs; do
+  modprobe "$m" 2>/dev/null || say "W: modprobe $m failed"
 done
 TGT=/dev/mmcblk0
 for i in $(seq 1 30); do [ -b "$TGT" ] && break; sleep 1; mdev -s 2>/dev/null || true; done
