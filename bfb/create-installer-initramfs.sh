@@ -84,8 +84,16 @@ fetch_tool() {
 }
 EFIBM=$(fetch_tool efibootmgr efibootmgr)
 QIMG=$(fetch_tool qemu-utils qemu-img)
-[ -n "$EFIBM" ] || die "efibootmgr unavailable (apt-get install efibootmgr failed)"
-[ -n "$QIMG" ]  || die "qemu-img unavailable (apt-get install qemu-utils failed)"
+SGDISK=$(fetch_tool gdisk sgdisk)
+PARTED=$(fetch_tool parted parted)
+RESIZEFS=$(fetch_tool e2fsprogs resize2fs)
+E2FSCK=$(fetch_tool e2fsprogs e2fsck)
+[ -n "$EFIBM" ]   || die "efibootmgr unavailable (apt-get install efibootmgr failed)"
+[ -n "$QIMG" ]    || die "qemu-img unavailable (apt-get install qemu-utils failed)"
+[ -n "$SGDISK" ]  || die "sgdisk unavailable (apt-get install gdisk failed)"
+[ -n "$PARTED" ]  || die "parted unavailable (apt-get install parted failed)"
+[ -n "$RESIZEFS" ] || die "resize2fs unavailable (apt-get install e2fsprogs failed)"
+[ -n "$E2FSCK" ]  || die "e2fsck unavailable (apt-get install e2fsprogs failed)"
 
 copy_with_libs() {
   local bin="$1" dst="$2"
@@ -99,12 +107,16 @@ copy_with_libs() {
 }
 copy_with_libs "$EFIBM" "$root/usr/bin/efibootmgr"
 copy_with_libs "$QIMG" "$root/usr/bin/qemu-img"
+copy_with_libs "$SGDISK" "$root/usr/bin/sgdisk"
+copy_with_libs "$PARTED" "$root/usr/bin/parted"
+copy_with_libs "$RESIZEFS" "$root/usr/bin/resize2fs"
+copy_with_libs "$E2FSCK" "$root/usr/bin/e2fsck"
 # the ELF interpreter path is /lib/ld-linux-aarch64.so.1; make sure it exists there
 if [ ! -e "$root/lib/ld-linux-aarch64.so.1" ]; then
   ld=$(find "$LIBDIR" /lib -name 'ld-linux-aarch64.so.1' 2>/dev/null | head -1)
   [ -n "$ld" ] && { mkdir -p "$root/lib"; cp "$ld" "$root/lib/ld-linux-aarch64.so.1"; }
 fi
-echo "I: bundled efibootmgr + qemu-img with $(find "$root/lib" "$root/usr/lib" -name '*.so*' 2>/dev/null | wc -l) shared libs"
+echo "I: bundled efibootmgr + qemu-img + sgdisk/parted/resize2fs with $(find "$root/lib" "$root/usr/lib" -name '*.so*' 2>/dev/null | wc -l) shared libs"
 
 # --- kernel modules ----------------------------------------------------------
 # Stage the WHOLE module tree plus depmod metadata, so the installer can
@@ -193,8 +205,11 @@ say "I: flashing DozenOS onto $TGT (this wipes it)..."
 qemu-img convert -n -p -f qcow2 -O raw /disk.qcow2 "$TGT" \
   || { say "E: qemu-img convert failed -- shell."; exec /bin/busybox sh; }
 say "I: ===== FLASH COMPLETE ====="
-# fix the backup GPT to the real (larger) eMMC end -- best effort
-command -v sgdisk >/dev/null 2>&1 && sgdisk -e "$TGT" 2>/dev/null || true
+# The image is sized for the smallest eMMC we support, so on a bigger card its
+# GPT describes only the first 16 GB -- the kernel says so directly
+# ("GPT: 33554431 != 81494015"). Move the backup header to the true end of the
+# disk so the tail becomes addressable.
+sgdisk -e "$TGT" >/dev/null 2>&1 || true
 sync
 # The kernel enumerated the partitions of whatever OS was on the eMMC before
 # this install, so ${TGT}p* still describe the OLD layout and would mount the
@@ -202,6 +217,27 @@ sync
 blockdev --rereadpt "$TGT" 2>/dev/null || true
 mdev -s 2>/dev/null || true
 for i in $(seq 1 10); do [ -b "${TGT}p2" ] && break; sleep 1; mdev -s 2>/dev/null || true; done
+
+# --- grow the root filesystem into the rest of the eMMC ----------------------
+# Extended IN PLACE: `parted resizepart` only rewrites partition 3's end
+# sector, so its start, its partition GUID and every data block stay exactly
+# where they are. Deleting and recreating the partition would also work (that
+# is what growpart does) but stakes the data on reproducing the start sector
+# byte-for-byte, and there is no reason to take that risk.
+grow_root() {
+  local out
+  out=$(parted -s "$TGT" resizepart 3 100% 2>&1) \
+    || { say "W: parted resizepart failed ($out); root stays at its image size"; return 1; }
+  blockdev --rereadpt "$TGT" 2>/dev/null || true
+  mdev -s 2>/dev/null || true
+  for i in $(seq 1 10); do [ -b "${TGT}p3" ] && break; sleep 1; mdev -s 2>/dev/null || true; done
+  # resize2fs refuses a filesystem that has not been checked since its last mount
+  e2fsck -fp "${TGT}p3" >/dev/null 2>&1
+  out=$(resize2fs "${TGT}p3" 2>&1) \
+    || { say "W: resize2fs failed ($out); partition grown but filesystem not"; return 1; }
+  say "I: root grown -- $(echo "$out" | tail -1)"
+}
+grow_root || true
 
 # Register a UEFI boot entry for the DozenOS ESP so the DPU boots it without a
 # manual EFI-shell step. The DozenOS image ESP is partition 2 with the
