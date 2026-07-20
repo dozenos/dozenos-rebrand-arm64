@@ -3,70 +3,66 @@
 Snapshot of where the BlueField-2 bring-up stands. Companion to
 [HARDWARE-FINDINGS.md](HARDWARE-FINDINGS.md) (the deep technical write-up).
 
-## Verified on real BF2 hardware (2026-07-19)
+## The whole chain works, unattended
 
-- BFB packaging, rshim push, `bfb-install` — work.
-- Installer initramfs loads the eMMC driver, `dd`s the DozenOS disk onto
-  `/dev/mmcblk0`, prints **FLASH COMPLETE**, reboots. ✅
-- After reboot, via UEFI **EFI shell**, our DozenOS **GRUB** loads and hands off
-  to our DozenOS kernel (`HW watchdog disabled`). ✅
-- What still failed on hardware: the installed kernel then hung mounting root,
-  because that (old) kernel lacked `CONFIG_MMC_DW` — the eMMC driver. Root cause
-  fixed in the kernel config (below); needs the rebuilt kernel to re-verify.
+One `bfb-install` push takes a BF2 from whatever was on its eMMC to a
+self-booting, loginable DozenOS. Every line below is from a real board.
 
-## Root causes found + fixed
+| Step | Evidence |
+|---|---|
+| Flash | `FLASH COMPLETE`, ~34 s (`Run /init` 4.86 s → `reboot` 38.83 s) |
+| Disk grown to fit the eMMC | `df`: 15 G → **38 G**, `lsblk` p3 38.6 G, GPT warning gone |
+| UEFI boot entry | `boot entry registered`, `BootOrder: 001A,…` (ours first) |
+| Auto-boot | `BootCurrent: 001A` — no operator action |
+| Serial login | `dozenos@dozenos:~$` over the BMC console (port 2200) |
+| Install log on the ESP | `ESP:/dozenos-install.log`, contents read back from the booted system |
 
-| Problem | Fix | Where |
-|---|---|---|
-| eMMC not found (wrong driver) | BF2 eMMC = `dw_mmc-bluefield` (ACPI PRP0001), **not** sdhci. Build `MMC/MMC_BLOCK/MMC_DW/MMC_DW_PLTFM/MMC_DW_BLUEFIELD =y` | `patches/kernel-config-bf2-offload.sh` (new `force_opt` helper) |
-| gzip vmlinuz rejected by UEFI | embed uncompressed arm64 Image | `bfb.yml` extract step |
-| busybox has no zstd | ship disk gzip'd, `zcat\|pv\|dd` | `bfb/create-installer-initramfs.sh` |
-| UEFI drops to PXE after dd (stale boot entries) | `efibootmgr -c -d mmcblk0 -p 2 -l \EFI\BOOT\BOOTAA64.EFI` | installer initramfs |
-| our-BFB firmware downgrade | pin default.bfb to DOCA 4.15.0 (debian13/arm64-dpu) | `bfb.yml` |
-| CI gate failed on MLXBF_PTM/IPMB | dropped (unresolved in 6.18, non-boot-critical) | kernel patch |
+## How each piece works
 
-## CI pipeline (now self-contained, "正宗")
+- **Flash** — `qemu-img convert -n -p -f qcow2 -O raw` straight onto
+  `/dev/mmcblk0`: allocated clusters only, zero regions become BLKZEROOUT, so
+  an install writes ~1 GB instead of the image's full 16 GB.
+- **Grow** — `sgdisk -e` moves the backup GPT to the true end of the disk, then
+  `parted resizepart 3 100%` extends the partition **in place** (only the end
+  sector is rewritten; start, partition GUID and data blocks are untouched) and
+  `resize2fs -f` grows the filesystem.
+- **Boot entry** — mirrors NVIDIA's own installer: mount efivarfs at the point
+  of use, drop any existing entry with our label, `efibootmgr -c -d
+  /dev/mmcblk0 -p 2 -L DozenOS -l '\EFI\BOOT\BOOTAA64.EFI'`, verify, retry,
+  and fall back to `bfbootmgr --cleanall`.
+- **Serial login** — comes from the flavor alone: `dpu.toml` sets
+  `console_type = "ttyAMA"`, GRUB puts `console=ttyAMA0,115200` on the cmdline,
+  and DozenOS derives its `system console device` from that. Nothing is
+  injected into config.boot and dozenos-build is untouched.
+- **Modules** — the initramfs carries the whole tree (1479 modules, 148 MB)
+  plus depmod metadata and uses `modprobe`, so dependencies resolve. EXT4,
+  VFAT, SQUASHFS and LOOP are all `=m` in the DozenOS kernel.
 
-```
-nightly.yml  ── builds MMC_DW kernel + dpu qcow2, publishes release
-     │ workflow_run (on success)
-bfb.yml      ── wraps the qcow2: OUR DozenOS kernel + dd installer
-                (efibootmgr + pv), 4.15.0 default.bfb base
-     ▼
-release asset: dozenos-<ver>-bf2.bfb   (bootable BFB)
-```
+## Release artefacts
 
-## In flight
+`nightly.yml` → release (iso, dpu qcow2, both minisigned) → `bfb.yml` chains on
+success → `dozenos-<ver>-bf2.bfb` **+ `.minisig`** on the same release. The
+auto-chain skips when the release already has its `.bfb` (a change-gated
+nightly still reports success), so it no longer burns a runner for nothing.
 
-- **nightly run 29713167773** — building `linux-kernel` with
-  `MMC_DW_BLUEFIELD=y` + `MLXBF_TMFIFO=y` (rshim hvc0 console usable in the
-  installer/early boot) + `EFIVAR_FS=y` (installer efibootmgr needs efivars
-  pre-modules; Kconfig default was =m). Run 29712072349 was cancelled to fold
-  these in — one kernel rebuild instead of two. ~1h15m; on success bfb.yml
-  auto-runs.
+## Open
 
-## Commits (all pushed)
+1. **OFED on arm64** — not started, and the premise needs a decision first.
+   The `amd64`-only guard in `build-mellanox-ofed.sh` is currently *deliberate*
+   (see `patches/ofed-25-01.sh`): OFED 25.01 is not expected to build against
+   kernel 6.18, and MLNX_OFED is EOL as a standalone product — from January
+   2025 NVIDIA ships DOCA-OFED instead. In-tree mlx5 is the primary driver and
+   OFED OOT modules are not shipped, so what is actually wanted may be the
+   userland tools (mstflint / mft / rshim) rather than an OOT module build.
+2. **GRUB serial noise** — every boot prints `error: serial port 'com0' isn't
+   found` / `error: terminal 'serial' isn't found`. Cosmetic: arm64 PL011 does
+   not take the x86 `com0` form. Deliberately deferred.
+3. **No CI gate for BFB regressions** — the whole chain is validated by pushing
+   to real hardware. Nothing in CI would catch a break.
 
-- rebrand-arm64: `force_opt` + MMC=y stack; drop PTM/IPMB; hardware-validated
-  `create-installer-initramfs.sh` (dw_mmc/gzip/pv/efibootmgr); HARDWARE-FINDINGS.md.
-- nightly-build-arm64: `bfb.yml` workflow_run auto-chain, 4.15 base, efibootmgr/pv,
-  DozenOS kernel; kernel-config gate includes `force_opt`.
+## Test rig
 
-## Pending / next (not yet done)
-
-1. **Confirm the rebuilt kernel boots to login** on eMMC (MMC_DW + efibootmgr +
-   auto-boot end-to-end — the pieces are proven separately, not yet together).
-2. Untested-together risks: our kernel as the *installer* kernel (proven only to
-   kernel-handoff), the efibootmgr auto-entry, full boot-to-login.
-3. **Installed-system console visibility**: DozenOS cmdline is `console=hvc0`
-   with no earlycon → early boot is silent until hvc0. Add earlycon for debug.
-4. **OFED on arm64** — deferred next phase. OFED *does* support arm64 (user
-   confirmed); the current amd64-only guard just needs removing + build deps
-   wired. Needed for VPP/DPDK/RDMA/DOCA, not for basic boot.
-5. Sign/publish the .bfb (currently uploaded unsigned; iso/qcow2 are signed).
-
-## Test rig (bf1 powered off)
-
-x86-64 staging VM `bf1` (172.30.0.138) talked to the BF2 via rshim; BMC host
-console `ssh -p 2200 root@<bmc>` (root/0penBmc). Rig is off now — all further
-work is in CI until hardware is available again.
+x86-64 staging VM `bf1` (172.30.0.160) drives the BF2 over rshim
+(`/dev/rshim0/{boot,console,misc}`). DPU BMC at 172.30.0.159, console
+`ssh -p 2200 root@<bmc>` (root/0penBmc). Install logs kept per attempt under
+`~/bf2-test/v*/` on bf1.
