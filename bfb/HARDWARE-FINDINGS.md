@@ -154,24 +154,45 @@ missing driver (`=y`), and `CONFIG_EFI` (=y).
 
 ### Blocker 2 — our BFB loses to the eMMC OS; the stock BFB does not
 
-**DISPROVEN as an NVRAM problem (2026-07-20).** A stock NVIDIA Ubuntu BFB
-pushed with `bfb-install` on this same board — with `Boot0022 DozenOS` present
-and bootable — **did** reach its rshim installer. So a valid NVRAM boot entry
-does *not* block BFB flashing, and UEFI does give the rshim boot precedence
-when the BFB asks for it correctly. The defect is in **our BFB packaging**.
+**RETRACTED — no cause established (2026-07-20).** Two independent checks
+knocked the NVRAM theory down, and the packaging theory that replaced it did
+not survive either.
 
-The symptom that led here: once `Boot0022 DozenOS` existed and pointed at a
-working bootloader, pushing *our* BFB installed nothing — UEFI followed
-BootOrder, booted DozenOS off the eMMC, and our installer never ran (no
-`BlueField-2 installer` banner in the console log). Our first two installs had
-worked only because BootOrder then held nothing bootable (a stale `ubuntu0`
-with a dangling partition GUID, plus network entries that all fail), so UEFI
-fell through to our rshim entry by luck rather than by priority.
+1. A stock NVIDIA Ubuntu BFB pushed with `bfb-install` on this board, with
+   `Boot0022 DozenOS` present and bootable, **did** reach its rshim installer.
+2. Our own timeline says the same thing: `Boot0022` was created at 06:38 and
+   the **v2 install at 06:49 ran fine**. Only the later v3 pushes did not.
 
-Open question, and the next thing to chase: what the stock BFB carries that
-makes UEFI prefer its rshim boot. Compare `mlx-mkbfb -d` of a stock
-`bf-bundle-*.bfb` against ours. Ours holds: ACPI-table-name v0, boot-desc v0,
-boot-path v0, boot-args v0+v2, kernel v0, initramfs v0.
+So a valid NVRAM boot entry does not block BFB flashing.
+
+A byte-level `mlx-mkbfb -x` comparison then cleared our packaging too — every
+field that governs the rshim boot entry is **identical to the stock BFB**:
+
+| image | stock | ours |
+|-------|-------|------|
+| `boot-desc-v0` | `Linux from rshim` | same |
+| `boot-path-v0` | `VenHw(F019E406-8C9C-11E5-8797-001ACA00BFC4)/Image` | same |
+| `boot-args-v0` | `console=ttyAMA1 console=hvc0 console=ttyAMA0 earlycon=pl011,0x01000000 earlycon=pl011,0x01800000 initrd=initramfs` | same |
+| `boot-args-v2` | `console=hvc0 console=ttyAMA0 earlycon=pl011,0x13010000 initrd=initramfs` | same |
+| `boot-acpi-v0` | `default` | same |
+
+Only two real differences remain, neither of which governs boot selection:
+stock carries an extra `info-v0` (a Redfish *Software Inventory* JSON listing
+BSP/ATF versions — reporting metadata for the BMC), and stock stores its kernel
+LZMA-compressed (12.8 MB) where ours is a raw Image (35.3 MB) — and our raw
+Image has demonstrably booted.
+
+v2 (worked) and v3 (did not) are themselves structurally identical: same
+kernel bytes, same boot metadata, initramfs 529.0 MB vs 534.0 MB.
+
+**Therefore the v3 "installer never ran" observation is unexplained, and the
+conditions it was taken under were poor**: a leftover v2 `bfb-install` process
+was still running, the rshim console bridge was torn down and rebuilt several
+times around the push, and the board was `SW_RESET` more than once mid-flight.
+The missing `BlueField-2 installer` banner may well be lost console output
+rather than a boot that never happened. **Next step: one controlled push — a
+single `bfb-install`, one long-lived console reader started before the push,
+no resets — before theorising further.**
 
 Things that do **not** solve it:
 
