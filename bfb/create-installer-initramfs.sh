@@ -231,10 +231,18 @@ grow_root() {
   blockdev --rereadpt "$TGT" 2>/dev/null || true
   mdev -s 2>/dev/null || true
   for i in $(seq 1 10); do [ -b "${TGT}p3" ] && break; sleep 1; mdev -s 2>/dev/null || true; done
-  # resize2fs refuses a filesystem that has not been checked since its last mount
-  e2fsck -fp "${TGT}p3" >/dev/null 2>&1
+  # resize2fs refuses a filesystem that has not been checked since its last
+  # mount. Use -f -y, not -p: preen mode gives up on anything it considers
+  # unexpected, and its exit status is easy to mistake for success. Report what
+  # it said -- swallowing this output once already hid why resize2fs then
+  # refused to run.
+  fsck_out=$(e2fsck -f -y "${TGT}p3" 2>&1); fsck_rc=$?
+  # 0 = clean, 1 = errors corrected; anything else means it could not do its job
+  if [ "$fsck_rc" -gt 1 ]; then
+    say "W: e2fsck rc=$fsck_rc: $(echo "$fsck_out" | tail -2)"
+  fi
   out=$(resize2fs "${TGT}p3" 2>&1) \
-    || { say "W: resize2fs failed ($out); partition grown but filesystem not"; return 1; }
+    || { say "W: resize2fs failed ($out); e2fsck said: $(echo "$fsck_out" | tail -2)"; return 1; }
   say "I: root grown -- $(echo "$out" | tail -1)"
 }
 grow_root || true
