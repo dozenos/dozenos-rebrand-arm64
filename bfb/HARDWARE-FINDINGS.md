@@ -152,18 +152,26 @@ not yet produced output (see blocker 2 — the installer stopped being reachable
 Ruled out: 64K-page runtime-region misalignment (the kernel is `ARM64_4K_PAGES`),
 missing driver (`=y`), and `CONFIG_EFI` (=y).
 
-### Blocker 2 — a valid NVRAM boot entry blocks BFB re-flashing
+### Blocker 2 — our BFB loses to the eMMC OS; the stock BFB does not
 
-Once `Boot0022 DozenOS` existed and pointed at a working bootloader, **pushing a
-BFB no longer installed anything**: UEFI followed BootOrder, booted DozenOS off
-the eMMC, and the installer never ran (`BlueField-2 installer` banner absent
-from the console log).
+**DISPROVEN as an NVRAM problem (2026-07-20).** A stock NVIDIA Ubuntu BFB
+pushed with `bfb-install` on this same board — with `Boot0022 DozenOS` present
+and bootable — **did** reach its rshim installer. So a valid NVRAM boot entry
+does *not* block BFB flashing, and UEFI does give the rshim boot precedence
+when the BFB asks for it correctly. The defect is in **our BFB packaging**.
 
-Why the first installs worked: BootOrder held only a stale `ubuntu0` (dangling
-partition GUID) and a set of network entries, all of which fail. UEFI fell
-through them and eventually reached the BFB's own "Linux from rshim" entry. A
-*successful* entry earlier in BootOrder stops that fall-through — so DozenOS
-bricks its own re-install path the moment it installs cleanly.
+The symptom that led here: once `Boot0022 DozenOS` existed and pointed at a
+working bootloader, pushing *our* BFB installed nothing — UEFI followed
+BootOrder, booted DozenOS off the eMMC, and our installer never ran (no
+`BlueField-2 installer` banner in the console log). Our first two installs had
+worked only because BootOrder then held nothing bootable (a stale `ubuntu0`
+with a dangling partition GUID, plus network entries that all fail), so UEFI
+fell through to our rshim entry by luck rather than by priority.
+
+Open question, and the next thing to chase: what the stock BFB carries that
+makes UEFI prefer its rshim boot. Compare `mlx-mkbfb -d` of a stock
+`bf-bundle-*.bfb` against ours. Ours holds: ACPI-table-name v0, boot-desc v0,
+boot-path v0, boot-args v0+v2, kernel v0, initramfs v0.
 
 Things that do **not** solve it:
 
@@ -187,7 +195,24 @@ exists.
 | rshim console (hvc0) | alive the whole boot, but **no getty** — DozenOS puts its getty on ttyAMA0 |
 | BMC SoL / ttyAMA0 (port 2200) | carries firmware, GRUB and early kernel output, then **goes silent in early userspace**; raw reads of both BMC UARTs return 0 bytes afterwards |
 | GRUB | renders on ttyAMA0 but **ignores serial input** (no `terminal_input serial`), so the menu cannot be interrupted to edit the cmdline |
-| UEFI setup menu | reachable by spamming ESC during UEFI, but **password-protected**; `bluefield` is rejected |
+| UEFI setup menu | reachable by spamming ESC during UEFI, but **password-protected**; `bluefield` is rejected (see below) |
+
+**UEFI password.** The documented default is `bluefield`, but BlueField forces a
+change on first use and the policy requires **12–64 characters**, so a board
+that has ever been entered has a non-guessable password. Official reset, run
+**on the DPU**:
+
+```bash
+sudo bfrec --capsule /usr/lib/firmware/mellanox/boot/capsule/EnrollKeysCap
+sudo reboot
+```
+
+The capsule is processed on the next boot and puts the password back to
+`bluefield` (which UEFI then makes you change again). Keep `EnrollKeysCap` a
+manual rescue step: it also enrols Secure Boot keys, so it must never be baked
+into a product BFB where every install would silently alter the board's
+security state. Our BFB bundles only `boot_update2.cap` (the ATF/UEFI firmware
+update, pinned to 4.15.0 to stop firmware downgrades) — not `EnrollKeysCap`.
 
 Net effect: the system boots and runs correctly yet cannot be logged into, and
 because of blocker 2 it also cannot be re-flashed. Recommended fix regardless of
