@@ -74,6 +74,12 @@ EOF
   cat > "$lk/patches/kernel/0002-build-linux-perf-package.patch" <<'EOF'
 (placeholder upstream patch)
 EOF
+  cat > "$lk/patches/kernel/0005-arm64-fix-relative-syscalltbl-path-in-Makefile.sysc.patch" <<'EOF'
+--- a/arch/arm64/kernel/Makefile.syscalls
++++ b/arch/arm64/kernel/Makefile.syscalls
+-syscalltbl = arch/arm64/tools/syscall_%.tbl
++syscalltbl = $(srctree)/arch/arm64/tools/syscall_%.tbl
+EOF
   cat > "$lk/build-kernel.sh" <<'EOF'
 #!/bin/bash
 CWD=$(pwd)
@@ -145,7 +151,7 @@ expect_line "$LK/config/20-netfilter.config" 'CONFIG_NF_FLOW_TABLE_PROCFS=y' "§
 expect_line "$LK/config/13-net-sched.config" '# CONFIG_NET_ACT_GATE is not set' "unrelated fragment line untouched"
 
 for opt in MLX5_CLS_ACT=y MLX5_TC_CT=y MLX5_TC_SAMPLE=y MELLANOX_PLATFORM=y \
-           MLXBF_GIGE=m MLXBF_TMFIFO=m MLXBF_BOOTCTL=m MLXBF_PMC=m \
+           MLXBF_GIGE=m MLXBF_TMFIFO=y MLXBF_BOOTCTL=m MLXBF_PMC=m \
            GPIO_MLXBF2=m GPIO_MLXBF3=m PINCTRL_MLXBF3=m I2C_MLXBF=m \
            POWER_MLXBF=m EDAC_BLUEFIELD=m MMC_SDHCI_OF_DWCMSHC=m; do
   expect_line "$LK/config/arm64/dozenos_defconfig" "CONFIG_$opt" "§6.2/6.3 $opt"
@@ -163,12 +169,9 @@ expect_line "$OFED" 'rm -f SOURCES/openmpi_*.tar.gz' "§6.4 upstream trim surviv
 expect_line "$OFED" "  --kernel-extra-args '--with-sf-cfg-drv'" "§6.4 --kernel-extra-args added"
 if bash -n "$OFED"; then ok "§6.4 patched script parses"; else bad "§6.4 patched script parses"; fi
 
-# install-kernel-patches (the arm64 perf-syscalltbl kernel source patch)
-KP="$LK/patches/kernel/0005-arm64-perf-abs-syscalltbl.patch"
-if [ -f "$KP" ]; then ok "kernel-patch: 0005 installed into patches/kernel/"; else bad "kernel-patch: 0005 installed into patches/kernel/"; fi
-if grep -qF 'syscalltbl = $(srctree)/arch/arm64/tools/syscall_%.tbl' "$KP" 2>/dev/null; then ok "kernel-patch: carries the absolute-syscalltbl fix"; else bad "kernel-patch: carries the absolute-syscalltbl fix"; fi
-# the patch content is byte-identical to the repo source
-if cmp -s "$TOOLKIT/patches/kernel/0005-arm64-perf-abs-syscalltbl.patch" "$KP"; then ok "kernel-patch: installed copy matches repo source"; else bad "kernel-patch: installed copy matches repo source"; fi
+# verify-kernel-patches (upstream's arm64 perf-syscalltbl kernel patch)
+if grep -q 'syscalltbl fix present' "$WORK/run1.log"; then ok "kernel-patch: upstream syscalltbl fix verified"; else bad "kernel-patch: upstream syscalltbl fix verified"; fi
+if [ -z "$(find "$LK/patches/kernel" -name '0005-arm64-perf-abs-syscalltbl.patch')" ]; then ok "kernel-patch: no duplicate patch installed"; else bad "kernel-patch: no duplicate patch installed"; fi
 
 # ---------------------------------------------------------------------------
 # Run 2: idempotency -- second run byte-identical.
@@ -247,8 +250,8 @@ else
 fi
 
 make_fixture "$WORK/tree-drift7"
-# upstream dropped the patches/kernel apply loop -> our kernel patch would be
-# dead, so install-kernel-patches must die
+# upstream dropped the patches/kernel apply loop -> the syscalltbl fix would
+# be dead, so verify-kernel-patches must die
 sed -i '/PATCH_DIR/d; /patches\/kernel/d' \
   "$WORK/tree-drift7/scripts/package-build/linux-kernel/build-kernel.sh"
 if "$SCRIPT" "$WORK/tree-drift7" >/dev/null 2>&1; then
@@ -258,13 +261,13 @@ else
 fi
 
 make_fixture "$WORK/tree-drift8"
-# a pre-existing patch already using the 0005- prefix -> must die (collision)
-cp "$WORK/tree-drift8/scripts/package-build/linux-kernel/patches/kernel/0002-build-linux-perf-package.patch" \
-   "$WORK/tree-drift8/scripts/package-build/linux-kernel/patches/kernel/0005-something-upstream.patch"
+# upstream dropped its arm64 syscalltbl fix -> linux-perf would break the
+# kernel build again, so verify-kernel-patches must die
+rm "$WORK/tree-drift8/scripts/package-build/linux-kernel/patches/kernel/0005-arm64-fix-relative-syscalltbl-path-in-Makefile.sysc.patch"
 if "$SCRIPT" "$WORK/tree-drift8" >/dev/null 2>&1; then
-  bad "0005 prefix collision: expected non-zero exit"
+  bad "upstream syscalltbl fix gone: expected non-zero exit"
 else
-  ok "0005 prefix collision: dies loudly"
+  ok "upstream syscalltbl fix gone: dies loudly"
 fi
 
 # ---------------------------------------------------------------------------
